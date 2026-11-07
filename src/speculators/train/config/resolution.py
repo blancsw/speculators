@@ -93,9 +93,10 @@ REQUIRED_FLAGS: dict[str, str] = _required_flags()
 # warns. DFlash2, DSpark and XPress share the DFlash backbone group; their exclusive
 # architecture knobs remain in their own groups. eagle3 uses no group.
 _ALGORITHM_GROUP_USERS: dict[str, frozenset[str]] = {
-    "dflash": frozenset({"dflash", "dflash2", "dspark", "xpress"}),
+    "dflash": frozenset({"dflash", "dflash2", "dspark", "kvn_dspark", "xpress"}),
     "dflash2": frozenset({"dflash2"}),
-    "dspark": frozenset({"dspark"}),
+    "dspark": frozenset({"dspark", "kvn_dspark"}),
+    "kvn_dspark": frozenset({"kvn_dspark"}),
     "xpress": frozenset({"xpress"}),
     "peagle": frozenset({"peagle"}),
     "mtp": frozenset({"mtp"}),

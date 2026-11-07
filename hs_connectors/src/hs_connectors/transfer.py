@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import dataclasses
-import fcntl
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows compatibility
+    fcntl = None  # type: ignore[assignment]
 import os
 import socket
 import time
@@ -23,6 +26,13 @@ if TYPE_CHECKING:
 
 
 def wait_for_lock(lock_path: str, timeout: float = 10.0, poll_interval: float = 0.1):
+    if fcntl is None:
+        deadline = time.monotonic() + timeout
+        while Path(lock_path).exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out waiting for lock: {lock_path}")
+            time.sleep(poll_interval)
+        return
     fd = os.open(lock_path, os.O_RDWR)
     try:
         deadline = time.monotonic() + timeout

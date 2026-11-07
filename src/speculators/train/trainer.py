@@ -784,7 +784,10 @@ class Trainer:
                 for old in ckpt_dir.glob(f"epoch{epoch}_*"):
                     if old.is_symlink():
                         old.unlink()
-                link_name.symlink_to(target)
+                try:
+                    link_name.symlink_to(target)
+                except OSError:
+                    pass
         root_logger.info(f"Checkpoint saved to {self.checkpointer.path / str(epoch)}")
 
     def maybe_update_best(self, epoch: int, val_metrics: dict | None):

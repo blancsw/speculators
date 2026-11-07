@@ -224,7 +224,10 @@ class BaseCheckpointer:
             else:
                 best_path.unlink()
 
-        best_path.symlink_to(target, target_is_directory=True)
+        try:
+            best_path.symlink_to(target, target_is_directory=True)
+        except OSError:
+            pass
 
     @_rank0_only
     def cleanup_keep_only_best(self, best_epoch: int) -> None:

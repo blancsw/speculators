@@ -1,4 +1,5 @@
 import logging
+import os
 import warnings
 from copy import deepcopy
 from functools import cache, partial
@@ -75,7 +76,7 @@ def resolve_verifier_norm_class(config) -> type:
 def conditional_torch_compile(func=None, *args, **kwargs):
     if func is None:
         return partial(conditional_torch_compile, *args, **kwargs)
-    if torch.cuda.is_available() and hasattr(torch, "compile"):
+    if os.name != "nt" and torch.cuda.is_available() and hasattr(torch, "compile"):
         return torch.compile(func, *args, **kwargs)
     return func
 

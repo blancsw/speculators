@@ -1,5 +1,8 @@
 import asyncio
-import fcntl
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows compatibility
+    fcntl = None  # type: ignore[assignment]
 import functools
 import logging
 import os

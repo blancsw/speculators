@@ -34,6 +34,7 @@ _ADAMW_NAME_HINTS = (
     "codebook",
     "markov_w1",
     "markov_w2",
+    "horizon_",
 )
 
 # Muon only orthogonalizes 2D weight matrices.

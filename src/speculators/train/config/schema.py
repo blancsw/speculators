@@ -563,6 +563,40 @@ class DSparkArgs(_Group):
     )
 
 
+class KvNDSparkArgs(_Group):
+    """KvN-DSpark Zero-KV-Cache Koopman-von Neumann RFF backbone knobs."""
+
+    kvn_backbone_type: Literal["kvn", "hybrid_1swa_2kvn", "swa"] = Field(
+        default="kvn",
+        description="KvN-DSpark backbone variant: 'kvn' (Zero-KV pure KvN-RFF), "
+        "'hybrid_1swa_2kvn' (1 SWA + KvN-RFF), or 'swa' (standard DSpark SWA).",
+    )
+    kvn_n_modes: int = Field(
+        default=256,
+        gt=0,
+        description="KvN-DSpark: number of Bosonic RFF harmonic modes M per layer.",
+    )
+    kvn_reupload_layers: int = Field(
+        default=2,
+        gt=0,
+        description="KvN-DSpark: number of Barthe Data Re-uploading stages L per layer.",
+    )
+    kvn_sigma_g: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="KvN-DSpark: spectral bandwidth for Bosonic RFF initialization.",
+    )
+    kvn_lasso_weight: float = Field(
+        default=1e-4,
+        ge=0.0,
+        description="KvN-DSpark: Barthe Theorem 5.6 LASSO L1 penalty weight on RFF readout.",
+    )
+    kvn_use_born_confidence: bool = Field(
+        default=True,
+        description="KvN-DSpark: feed amplified Born-rule energy 2M*(q^2+p^2)-1 into confidence head.",
+    )
+
+
 class XPressArgs(_Group):
     """XPress-exclusive knobs (causal-refiner head + Jacobi consistency)."""
 
@@ -655,6 +689,7 @@ _GROUPS: dict[str, type[_Group]] = {
     "dflash": DFlashArgs,
     "dflash2": DFlash2Args,
     "dspark": DSparkArgs,
+    "kvn_dspark": KvNDSparkArgs,
     "xpress": XPressArgs,
     "peagle": PEagleArgs,
     "mtp": MTPArgs,
@@ -780,6 +815,7 @@ class TrainConfig(BaseSettings):
     dflash: DFlashArgs = Field(default_factory=DFlashArgs)
     dflash2: DFlash2Args = Field(default_factory=DFlash2Args)
     dspark: DSparkArgs = Field(default_factory=DSparkArgs)
+    kvn_dspark: KvNDSparkArgs = Field(default_factory=KvNDSparkArgs)
     xpress: XPressArgs = Field(default_factory=XPressArgs)
     peagle: PEagleArgs = Field(default_factory=PEagleArgs)
     mtp: MTPArgs = Field(default_factory=MTPArgs)
@@ -790,7 +826,7 @@ class TrainConfig(BaseSettings):
         pre-refactor ``parse_args``: unset ``draft_arch`` -> ``llama`` for eagle3 else
         ``qwen3``; unset ``norm_before_fc`` / ``norm_output`` -> ``True`` for eagle3
         else ``False``; unset ``muon_lr`` -> ``lr``; unset ``num_layers`` -> ``5``
-        for dflash/dspark/dflash2/xpress else ``1``; unset
+        for dflash/dspark/kvn_dspark/dflash2/xpress else ``1``; unset
         ``per_position_loss_weight`` -> ``dpace`` for dflash else
         ``fixed-exp-decay``; unset ``loss_fn`` -> ``ce`` for dflash,
         ``{"ce": 0.1, "tv": 0.9}`` for xpress, else ``kl_div``; unset
@@ -820,6 +856,7 @@ class TrainConfig(BaseSettings):
         is_dflash_family = self.speculator_type in {
             "dflash",
             "dspark",
+            "kvn_dspark",
             "dflash2",
             "xpress",
         }
