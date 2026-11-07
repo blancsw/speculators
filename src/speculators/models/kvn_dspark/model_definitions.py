@@ -101,26 +101,36 @@ class CausalKvNRFFLayer(nn.Module):
             nn.Linear(2 * d_model, d_model),
         )
 
+    @torch.compiler.disable
     def _fft_causal_dynamics(
         self,
         u_q: torch.Tensor,
         u_p: torch.Tensor,
-        dtheta_bar: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Exact causal damped harmonic oscillator convolution in float32 via FFT."""
+        """Exact causal damped harmonic oscillator convolution in float32 via FFT.
+
+        Computes the strictly causal LTI response:
+            z_t = exp((-eta + i * omega_pole)) * z_{t-1} + u_t
+        which is mathematically identical to O(1) recurrent step-by-step inference
+        with zero future token leakage.
+        """
         with torch.amp.autocast(device_type=u_q.device.type, enabled=False):
             u_q_f = u_q.float()
             u_p_f = u_p.float()
-            dtheta_f = dtheta_bar.float()
 
-            seq_len = u_q_f.size(1)
-            t_idx = torch.arange(seq_len, device=u_q_f.device, dtype=torch.float32).view(
-                1, seq_len, 1
+            seq_len = int(u_q_f.size(1))
+            t_idx = torch.arange(
+                seq_len, device=u_q_f.device, dtype=torch.float32
+            ).view(1, seq_len, 1)
+
+            eta = (
+                torch.exp(self.log_eta.float())
+                .clamp(min=1e-4, max=2.0)
+                .view(1, 1, -1)
             )
-
-            eta = torch.exp(self.log_eta.float()).clamp(min=1e-4, max=2.0).view(1, 1, -1)
+            omega_pole = self.kvn_omega.float().view(1, 1, -1)
             decay = torch.exp(-eta * t_idx)
-            phase = dtheta_f * t_idx
+            phase = omega_pole * t_idx
 
             k_cos = decay * torch.cos(phase)
             k_sin = decay * torch.sin(phase)
@@ -138,20 +148,23 @@ class CausalKvNRFFLayer(nn.Module):
             p_seq = torch.fft.irfft(f_p, n=fft_size, dim=1)[:, :seq_len, :]
         return q_seq.to(u_q.dtype), p_seq.to(u_p.dtype)
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (x_out [B, T, D], q_seq [B, T, M], p_seq [B, T, M], dtheta_seq [B, T, M])."""
-        h = self.reupload(self.norm1(x))
+    def recurrent_step(
+        self,
+        x_step: torch.Tensor,
+        state: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """O(1) Zero-KV-Cache symplectic step for a single token x_step [B, 1, D].
 
+        Returns (x_out [B, 1, D], (q_t [B, 1, M], p_t [B, 1, M]), dtheta_t [B, 1, M]).
+        """
+        h = self.reupload(self.norm1(x_step))
         proj = F.linear(h, self.omega.to(h.dtype), self.bias.to(h.dtype))
-        scale = 1.0 / math.sqrt(self.n_modes)
-        z_q = scale * torch.cos(proj)
-        z_p = scale * torch.sin(proj)
-
+        cos_p = torch.cos(proj)
+        sin_p = torch.sin(proj)
         alpha = torch.tanh(self.raw_alpha.to(h.dtype))
-        r_q = z_q + alpha * (z_q * z_q - z_p * z_p)
-        r_p = z_p + 2.0 * alpha * (z_q * z_p)
+        scale = 1.0 / math.sqrt(self.n_modes)
+        r_q = scale * (cos_p + alpha * (cos_p * cos_p - sin_p * sin_p))
+        r_p = scale * (sin_p + 2.0 * alpha * (cos_p * sin_p))
 
         dt = F.softplus(self.dt_proj(h))
         dtheta = dt * self.kvn_omega.to(h.dtype)
@@ -159,8 +172,59 @@ class CausalKvNRFFLayer(nn.Module):
         u_q = dt * self.in_gain_q.to(h.dtype) * r_q
         u_p = dt * self.in_gain_p.to(h.dtype) * r_p
 
-        dtheta_bar = dtheta.mean(dim=1, keepdim=True)
-        q_seq, p_seq = self._fft_causal_dynamics(u_q, u_p, dtheta_bar)
+        with torch.amp.autocast(device_type=x_step.device.type, enabled=False):
+            eta = (
+                torch.exp(self.log_eta.float())
+                .clamp(min=1e-4, max=2.0)
+                .view(1, 1, -1)
+            )
+            omega_pole = self.kvn_omega.float().view(1, 1, -1)
+            decay = torch.exp(-eta)
+            k_cos = decay * torch.cos(omega_pole)
+            k_sin = decay * torch.sin(omega_pole)
+
+            if state is None:
+                q_prev = torch.zeros_like(u_q, dtype=torch.float32)
+                p_prev = torch.zeros_like(u_p, dtype=torch.float32)
+            else:
+                q_prev = state[0].float()
+                p_prev = state[1].float()
+
+            q_f = k_cos * q_prev - k_sin * p_prev + u_q.float()
+            p_f = k_sin * q_prev + k_cos * p_prev + u_p.float()
+
+        q_t = q_f.to(x_step.dtype)
+        p_t = p_f.to(x_step.dtype)
+
+        born_energy = (2.0 * self.n_modes) * (q_t.square() + p_t.square()) - 1.0
+        obs = torch.cat([q_t, p_t, born_energy], dim=-1)
+        readout = self.readout_norm(self.readout_linear(obs))
+
+        x_out = x_step + readout
+        x_out = x_out + self.ffn(self.norm2(x_out))
+        return x_out, (q_t, p_t), dtheta
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (x_out [B, T, D], q_seq [B, T, M], p_seq [B, T, M], dtheta_seq [B, T, M])."""
+        h = self.reupload(self.norm1(x))
+
+        proj = F.linear(h, self.omega.to(h.dtype), self.bias.to(h.dtype))
+        cos_p = torch.cos(proj)
+        sin_p = torch.sin(proj)
+        alpha = torch.tanh(self.raw_alpha.to(h.dtype))
+        scale = 1.0 / math.sqrt(self.n_modes)
+        r_q = scale * (cos_p + alpha * (cos_p * cos_p - sin_p * sin_p))
+        r_p = scale * (sin_p + 2.0 * alpha * (cos_p * sin_p))
+
+        dt = F.softplus(self.dt_proj(h))
+        dtheta = dt * self.kvn_omega.to(h.dtype)
+
+        u_q = dt * self.in_gain_q.to(h.dtype) * r_q
+        u_p = dt * self.in_gain_p.to(h.dtype) * r_p
+
+        q_seq, p_seq = self._fft_causal_dynamics(u_q, u_p)
 
         # Barthe Ch. 4 Theorem 4.2 amplified Born-rule energy observable: 2M*(q^2 + p^2) - 1
         born_energy = (2.0 * self.n_modes) * (q_seq.square() + p_seq.square()) - 1.0
@@ -172,26 +236,34 @@ class CausalKvNRFFLayer(nn.Module):
         return x, q_seq, p_seq, dtheta
 
     def mode_importance(self) -> torch.Tensor:
-        """Compute L1 importance score of each harmonic mode m in [0 .. M-1]."""
-        w = self.readout_linear.weight  # [d_model, 3 * n_modes]
+        """Compute L2 group importance score of each harmonic mode m in [0 .. M-1]."""
+        w = self.readout_linear.weight.float()  # [d_model, 3 * n_modes]
         m = self.n_modes
-        imp_q = w[:, :m].abs().sum(dim=0)
-        imp_p = w[:, m : 2 * m].abs().sum(dim=0)
-        imp_b = w[:, 2 * m :].abs().sum(dim=0)
-        return imp_q + imp_p + imp_b
+        imp_q = w[:, :m].square().mean(dim=0)
+        imp_p = w[:, m : 2 * m].square().mean(dim=0)
+        imp_b = w[:, 2 * m :].square().mean(dim=0)
+        return torch.sqrt(imp_q + imp_p + imp_b + 1e-12)
 
     def lasso_penalty(self) -> torch.Tensor:
-        """Barthe Ch. 5 Theorem 5.6 L1 regularization over mode readout weights."""
-        return self.readout_linear.weight.abs().mean()
+        """Barthe Ch. 5 Theorem 5.6 Group-LASSO (L_{2,1}) + L1 penalty over mode readouts."""
+        group_l21 = self.mode_importance().mean()
+        elem_l1 = self.readout_linear.weight.abs().mean()
+        return 0.5 * (group_l21 + elem_l1)
 
     @torch.no_grad()
-    def prune_to_top_modes(self, target_modes: int) -> torch.Tensor:
+    def prune_to_top_modes(
+        self,
+        target_modes: int,
+        extra_importance: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Structurally prune inactive RFF modes (M_train -> M_infer) for HBM Roofline speed."""
         if target_modes <= 0 or target_modes >= self.n_modes:
             return torch.arange(self.n_modes, device=self.omega.device)
 
         old_m = self.n_modes
         importance = self.mode_importance()
+        if extra_importance is not None:
+            importance = importance + extra_importance.to(importance.device)
         _, top_idx = torch.topk(importance, k=target_modes, largest=True, sorted=True)
 
         scale_ratio = math.sqrt(target_modes / old_m)
@@ -215,10 +287,12 @@ class CausalKvNRFFLayer(nn.Module):
         self.in_gain_q = nn.Parameter(self.in_gain_q.data[top_idx].clone())
         self.in_gain_p = nn.Parameter(self.in_gain_p.data[top_idx].clone())
 
+        # q_m and p_m scale by 1/scale_ratio after n_modes changes, whereas
+        # born_energy = 2*M*(q_m^2 + p_m^2) - 1 is strictly invariant to M.
         w_old = self.readout_linear.weight.data
         w_q = w_old[:, top_idx] * scale_ratio
         w_p = w_old[:, old_m + top_idx] * scale_ratio
-        w_b = w_old[:, 2 * old_m + top_idx] * (scale_ratio * scale_ratio)
+        w_b = w_old[:, 2 * old_m + top_idx]
 
         new_readout = nn.Linear(
             3 * target_modes,
@@ -251,10 +325,8 @@ class MultiHorizonKoopmanRollout(nn.Module):
         self.horizon_phase_bias = nn.Parameter(torch.zeros(block_size, n_modes))
 
         self.anchor_proj = nn.Linear(d_model, block_size * d_model)
-        self.obs_to_hidden = nn.Sequential(
-            nn.RMSNorm(3 * n_modes),
-            nn.Linear(3 * n_modes, d_model),
-        )
+        self.obs_linear = nn.Linear(3 * n_modes, d_model)
+        self.obs_norm = nn.RMSNorm(d_model)
         self.out_norm = nn.RMSNorm(d_model)
 
     def forward(
@@ -293,13 +365,26 @@ class MultiHorizonKoopmanRollout(nn.Module):
         born_features = (2.0 * self.n_modes) * born_prob - 1.0
 
         obs_k = torch.cat([q_k, p_k, born_features], dim=-1)  # [N_blocks, K, 3M]
-        kvn_hidden = self.obs_to_hidden(obs_k)
+        kvn_hidden = self.obs_norm(self.obs_linear(obs_k))
 
         anchor_cond = self.anchor_proj(anchor_h).view(
             n_blocks, self.block_size, self.d_model
         )
         hidden_blocks = self.out_norm(anchor_cond + kvn_hidden)
         return hidden_blocks, born_features
+
+    def mode_importance(self) -> torch.Tensor:
+        """Compute L2 group importance of each mode in rollout obs_linear."""
+        w = self.obs_linear.weight.float()
+        m = self.n_modes
+        imp_q = w[:, :m].square().mean(dim=0)
+        imp_p = w[:, m : 2 * m].square().mean(dim=0)
+        imp_b = w[:, 2 * m :].square().mean(dim=0)
+        return torch.sqrt(imp_q + imp_p + imp_b + 1e-12)
+
+    def lasso_penalty(self) -> torch.Tensor:
+        """Group-LASSO + L1 penalty on rollout mode readout weights."""
+        return 0.5 * (self.mode_importance().mean() + self.obs_linear.weight.abs().mean())
 
     @torch.no_grad()
     def prune_to_indices(self, top_idx: torch.Tensor) -> None:
@@ -308,6 +393,8 @@ class MultiHorizonKoopmanRollout(nn.Module):
         target_modes = int(top_idx.numel())
         if target_modes >= old_m:
             return
+
+        scale_ratio = math.sqrt(target_modes / old_m)
 
         self.horizon_freq_scale = nn.Parameter(
             self.horizon_freq_scale.data[:, top_idx].clone()
@@ -319,28 +406,21 @@ class MultiHorizonKoopmanRollout(nn.Module):
             self.horizon_phase_bias.data[:, top_idx].clone()
         )
 
-        old_norm = self.obs_to_hidden[0]
-        old_lin = self.obs_to_hidden[1]
-        assert isinstance(old_norm, nn.RMSNorm) and isinstance(old_lin, nn.Linear)
-
-        cat_idx = torch.cat(
-            [top_idx, old_m + top_idx, 2 * old_m + top_idx], dim=0
-        )
-        new_norm = nn.RMSNorm(
-            3 * target_modes, device=top_idx.device, dtype=old_lin.weight.dtype
-        )
-        new_norm.weight.copy_(old_norm.weight.data[cat_idx])
+        w_old = self.obs_linear.weight.data
+        w_q = w_old[:, top_idx] * scale_ratio
+        w_p = w_old[:, old_m + top_idx] * scale_ratio
+        w_b = w_old[:, 2 * old_m + top_idx]
 
         new_lin = nn.Linear(
             3 * target_modes,
             self.d_model,
             device=top_idx.device,
-            dtype=old_lin.weight.dtype,
+            dtype=self.obs_linear.weight.dtype,
         )
-        new_lin.weight.copy_(old_lin.weight.data[:, cat_idx])
-        new_lin.bias.copy_(old_lin.bias.data)
+        new_lin.weight.copy_(torch.cat([w_q, w_p, w_b], dim=-1))
+        new_lin.bias.copy_(self.obs_linear.bias.data)
 
-        self.obs_to_hidden = nn.Sequential(new_norm, new_lin)
+        self.obs_linear = new_lin
         self.n_modes = target_modes
 
 
@@ -360,14 +440,14 @@ class BornConfidenceHead(nn.Module):
         self.markov_rank = markov_rank
         self.n_modes = n_modes
         self.use_born = use_born and (n_modes > 0)
-        input_dim = hidden_size + markov_rank + (n_modes if self.use_born else 0)
+        base_dim = hidden_size + markov_rank
         mid = intermediate_size or max(64, hidden_size // 2)
-        self.net = nn.Sequential(
-            nn.RMSNorm(input_dim),
-            nn.Linear(input_dim, mid),
-            nn.SiLU(),
-            nn.Linear(mid, 1),
+        self.base_norm = nn.RMSNorm(base_dim)
+        self.base_linear = nn.Linear(base_dim, mid)
+        self.born_proj: nn.Linear | None = (
+            nn.Linear(n_modes, mid, bias=False) if self.use_born else None
         )
+        self.out_linear = nn.Linear(mid, 1)
 
     def forward(
         self,
@@ -375,46 +455,42 @@ class BornConfidenceHead(nn.Module):
         prev_emb: torch.Tensor | None = None,
         born_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        parts = [hidden_blocks]
         if prev_emb is not None and self.markov_rank > 0:
-            parts.append(prev_emb.to(hidden_blocks.dtype))
-        if self.use_born and born_features is not None:
-            parts.append(born_features.to(hidden_blocks.dtype))
-        features = torch.cat(parts, dim=-1)
-        return self.net(features).squeeze(-1)
+            base = torch.cat([hidden_blocks, prev_emb.to(hidden_blocks.dtype)], dim=-1)
+        else:
+            base = hidden_blocks
+        h = self.base_linear(self.base_norm(base))
+        if self.use_born and self.born_proj is not None and born_features is not None:
+            h = h + self.born_proj(born_features.to(h.dtype))
+        return self.out_linear(F.silu(h)).squeeze(-1)
+
+    def mode_importance(self) -> torch.Tensor | None:
+        if not self.use_born or self.born_proj is None:
+            return None
+        return torch.sqrt(self.born_proj.weight.float().square().mean(dim=0) + 1e-12)
+
+    def lasso_penalty(self) -> torch.Tensor:
+        if not self.use_born or self.born_proj is None:
+            return torch.tensor(0.0, device=self.base_linear.weight.device)
+        imp = self.mode_importance()
+        assert imp is not None
+        return 0.5 * (imp.mean() + self.born_proj.weight.abs().mean())
 
     @torch.no_grad()
     def prune_born_modes(self, top_idx: torch.Tensor) -> None:
-        if not self.use_born:
+        if not self.use_born or self.born_proj is None:
             return
         target_modes = int(top_idx.numel())
         if target_modes >= self.n_modes:
             return
 
-        prefix_dim = self.hidden_size + self.markov_rank
-        keep_idx = torch.cat(
-            [torch.arange(prefix_dim, device=top_idx.device), prefix_dim + top_idx],
-            dim=0,
-        )
-        old_norm = self.net[0]
-        old_lin1 = self.net[1]
-        assert isinstance(old_norm, nn.RMSNorm) and isinstance(old_lin1, nn.Linear)
-
-        new_in_dim = prefix_dim + target_modes
-        new_norm = nn.RMSNorm(
-            new_in_dim, device=top_idx.device, dtype=old_lin1.weight.dtype
-        )
-        new_norm.weight.copy_(old_norm.weight.data[keep_idx])
-
-        new_lin1 = nn.Linear(
-            new_in_dim,
-            old_lin1.out_features,
+        new_born = nn.Linear(
+            target_modes,
+            self.born_proj.out_features,
+            bias=False,
             device=top_idx.device,
-            dtype=old_lin1.weight.dtype,
+            dtype=self.born_proj.weight.dtype,
         )
-        new_lin1.weight.copy_(old_lin1.weight.data[:, keep_idx])
-        new_lin1.bias.copy_(old_lin1.bias.data)
-
-        self.net[0] = new_norm
-        self.net[1] = new_lin1
+        new_born.weight.copy_(self.born_proj.weight.data[:, top_idx])
+        self.born_proj = new_born
         self.n_modes = target_modes

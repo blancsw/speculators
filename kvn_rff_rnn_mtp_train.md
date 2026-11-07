@@ -183,11 +183,11 @@ pytest tests/unit/models/test_kvn_dspark.py -v
 python examples/train/kvn_dspark_local_rtx3070ti_validate.py
 ```
 
-### Tableau des Résultats Obtenus sur `RTX 3070 Ti` (`Qwen/Qwen3.5-0.8B`, 5 époques)
+### Tableau des Résultats Obtenus sur `RTX 3070 Ti` (`Qwen/Qwen3.5-0.8B`, 5 époques, Causalité Stricte Auditée)
 
-| Modèle (`speculators.train`) | Backbone | Modes RFF ($M_{\text{train}} \to M_{\text{infer}}$) | Cache d'État / Séquence | Params Actifs Drafter | Pos-0 Acc (%) | Greedy EAL (tokens/passe) | Erreur Calibration Confiance (`ConfMAE`) | Temps Train (5 époques) |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`M1_DSpark_SWA_Baseline`** | `3× SWA-128` | — | `1,572,864 B` (1.57 Mo) | `84.96 M` | `79.69%` | `2.1406` | `0.0938` | `18.75s` |
-| **`M2_DSpark_Hybrid_1SWA_2KvN`** | `1× SWA + 2× KvN` | `128 -> 128` | `525,312 B` (`-66.6%`) | `77.06 M` | `75.00%` | `2.3672` | `0.0508` | `18.26s` |
-| **`M3_KvN_DSpark_ZeroKV_Base`** | **`3× KvN (0 SWA)`** | `128 -> 128` | **`1,536 B` (`-99.90%`)** | **`68.68 M` (`-19.2%`)** | `72.66%` | `2.1719` | **`0.0336`** | **`16.34s`** |
-| **`M4_KvN_DSpark_ZeroKV_Scaled_LASSO`** | **`3× KvN (0 SWA)`** | **`512 -> 128`** | **`1,536 B` (`-99.90%`)** | **`68.68 M` (`-19.2%`)** | `72.66%` | **`2.6250` (`+22.6%`)** | `0.0518` | `17.25s` |
+| Modèle (`speculators.train`) | Backbone | Modes RFF ($M_{\text{train}} \to M_{\text{infer}}$) | Cache d'État / Séquence | Params Actifs Drafter | Accept Rate (%) | AcceptLen ($\tau$) | Greedy EAL (tokens/passe) | Erreur Calibration Confiance (`ConfMAE`) | Temps Train (5 époques) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`M1_DSpark_SWA_Baseline`** | `3× SWA-128` | — | `1,572,864 B` (1.57 Mo) | `84.96 M` | `12.81%` | `1.5613` | `2.1406` | `0.0938` | `18.70s` |
+| **`M2_DSpark_Hybrid_1SWA_2KvN`** | `1× SWA + 2× KvN` | `128 -> 128` | `525,312 B` (`-66.6%`) | `77.06 M` | `12.25%` | **`1.5805`** | **`2.4688` (`+15.3%`)** | `0.0742` | `19.70s` |
+| **`M3_KvN_DSpark_ZeroKV_Base`** | **`3× KvN (0 SWA)`** | `128 -> 128` | **`1,536 B` (`-99.90%`)** | **`68.68 M` (`-19.2%`)** | `8.71%` | `1.3325` | `2.2344` (`+4.4%`) | **`0.0627`** | `24.01s` |
+| **`M4_KvN_DSpark_ZeroKV_Scaled_LASSO`** | **`3× KvN (0 SWA)`** | **`512 -> 128`** | **`1,536 B` (`-99.90%`)** | **`68.68 M` (`-19.2%`)** | **`13.10%`** | **`1.5588`** | **`2.3359` (`+9.1%`)** | `0.0794` | `21.13s` |

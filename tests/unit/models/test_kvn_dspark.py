@@ -187,3 +187,173 @@ def test_kvn_dspark_draft_model_forward_backward_and_pruning(backbone_type: str)
             max_anchors=4,
         )
         assert torch.isfinite(loss_after)
+
+
+def test_strict_causality_no_future_leakage():
+    """Verify that modifying tokens t > t0 has zero effect on outputs/states at t <= t0."""
+    torch.manual_seed(123)
+    layer = CausalKvNRFFLayer(d_model=64, n_modes=32, reupload_layers_l=2)
+    layer.eval()
+
+    x1 = torch.randn(1, 20, 64)
+    x2 = x1.clone()
+    t0 = 10
+    # Mutate all future positions t > t0 drastically
+    x2[:, t0 + 1 :, :] = torch.randn_like(x2[:, t0 + 1 :, :]) * 100.0
+
+    out1, q1, p1, dtheta1 = layer(x1)
+    out2, q2, p2, dtheta2 = layer(x2)
+
+    assert torch.allclose(out1[:, : t0 + 1], out2[:, : t0 + 1], atol=1e-5)
+    assert torch.allclose(q1[:, : t0 + 1], q2[:, : t0 + 1], atol=1e-5)
+    assert torch.allclose(p1[:, : t0 + 1], p2[:, : t0 + 1], atol=1e-5)
+    assert torch.allclose(dtheta1[:, : t0 + 1], dtheta2[:, : t0 + 1], atol=1e-5)
+
+
+def test_fft_equals_recurrent_step_o1_state():
+    """Verify parallel O(T log T) FFT dynamics match O(1) step-by-step recurrent inference."""
+    torch.manual_seed(99)
+    layer = CausalKvNRFFLayer(d_model=64, n_modes=32, reupload_layers_l=2)
+    layer.eval()
+
+    x = torch.randn(2, 16, 64)
+    fft_out, fft_q, fft_p, fft_dtheta = layer(x)
+
+    state = None
+    rec_outs, rec_qs, rec_ps, rec_dthetas = [], [], [], []
+    for t in range(x.size(1)):
+        x_step, state, dtheta_step = layer.recurrent_step(x[:, t : t + 1, :], state)
+        rec_outs.append(x_step)
+        rec_qs.append(state[0])
+        rec_ps.append(state[1])
+        rec_dthetas.append(dtheta_step)
+
+    rec_out = torch.cat(rec_outs, dim=1)
+    rec_q = torch.cat(rec_qs, dim=1)
+    rec_p = torch.cat(rec_ps, dim=1)
+    rec_dtheta = torch.cat(rec_dthetas, dim=1)
+
+    assert torch.allclose(fft_out, rec_out, atol=1e-5)
+    assert torch.allclose(fft_q, rec_q, atol=1e-5)
+    assert torch.allclose(fft_p, rec_p, atol=1e-5)
+    assert torch.allclose(fft_dtheta, rec_dtheta, atol=1e-5)
+
+
+def test_exact_pruning_invariance_when_inactive_modes_zero():
+    """Verify Barthe LASSO pruning theorem: zero-weight inactive modes prune with zero error."""
+    torch.manual_seed(314)
+    cfg = _make_kvn_config(backbone_type="kvn", n_modes=32, block_size=4, num_layers=2)
+    model = KvNDSparkDraftModel(cfg)
+    _init_dummy_verifier_weights(model)
+    model.eval()
+
+    # Zero out readout columns for modes 16..31 across all layers, rollout, and born_proj
+    with torch.no_grad():
+        for layer in model.kvn_layers:
+            m = layer.n_modes
+            layer.readout_linear.weight[:, 16:m] = 0.0
+            layer.readout_linear.weight[:, m + 16 : 2 * m] = 0.0
+            layer.readout_linear.weight[:, 2 * m + 16 : 3 * m] = 0.0
+        assert model.rollout is not None
+        m = model.rollout.n_modes
+        model.rollout.obs_linear.weight[:, 16:m] = 0.0
+        model.rollout.obs_linear.weight[:, m + 16 : 2 * m] = 0.0
+        model.rollout.obs_linear.weight[:, 2 * m + 16 : 3 * m] = 0.0
+        assert model.born_confidence_head is not None
+        assert model.born_confidence_head.born_proj is not None
+        model.born_confidence_head.born_proj.weight[:, 16:m] = 0.0
+
+    seq_len = 24
+    hidden_states = torch.randn(1, seq_len, 3 * 64)
+    input_ids = torch.randint(0, 128, (1, seq_len))
+    loss_mask = torch.zeros(1, seq_len, dtype=torch.bool)
+    # Fix exactly 2 deterministic anchors at positions 4 and 10
+    loss_mask[0, 4] = True
+    loss_mask[0, 10] = True
+    verifier_last_hs = torch.randn(1, seq_len, 64)
+    document_ids = torch.zeros(1, seq_len, dtype=torch.long)
+
+    _, logits_before, _, _, _, born_before = model._kvn_backbone_forward(
+        hidden_states=hidden_states,
+        input_ids=input_ids,
+        loss_mask=loss_mask,
+        verifier_last_hidden_states=verifier_last_hs,
+        document_ids=document_ids,
+        max_anchors=2,
+    )
+    _, loss_before, _ = model(
+        hidden_states=hidden_states,
+        input_ids=input_ids,
+        loss_mask=loss_mask,
+        verifier_last_hidden_states=verifier_last_hs,
+        document_ids=document_ids,
+        max_anchors=2,
+    )
+
+    model.prune_kvn_modes(16)
+    assert model.config.kvn_n_modes == 16
+
+    _, logits_after, _, _, _, born_after = model._kvn_backbone_forward(
+        hidden_states=hidden_states,
+        input_ids=input_ids,
+        loss_mask=loss_mask,
+        verifier_last_hidden_states=verifier_last_hs,
+        document_ids=document_ids,
+        max_anchors=2,
+    )
+    _, loss_after, _ = model(
+        hidden_states=hidden_states,
+        input_ids=input_ids,
+        loss_mask=loss_mask,
+        verifier_last_hidden_states=verifier_last_hs,
+        document_ids=document_ids,
+        max_anchors=2,
+    )
+
+    assert torch.allclose(logits_before, logits_after, atol=1e-5)
+    assert torch.allclose(loss_before, loss_after, atol=1e-4)
+
+
+def test_save_and_reload_pruned_checkpoint(tmp_path):
+    """Verify pruned checkpoint saves to safetensors and reloads via from_pretrained."""
+    torch.manual_seed(55)
+    cfg = _make_kvn_config(backbone_type="kvn", n_modes=32, block_size=4, num_layers=2)
+    model = KvNDSparkDraftModel(cfg)
+    _init_dummy_verifier_weights(model)
+    model.prune_kvn_modes(16)
+
+    ckpt_dir = tmp_path / "pruned_m16"
+    model.save_pretrained(ckpt_dir)
+
+    reloaded = KvNDSparkDraftModel.from_pretrained(ckpt_dir)
+    _init_dummy_verifier_weights(reloaded)
+    assert reloaded.config.kvn_n_modes == 16
+    assert reloaded.kvn_layers[0].n_modes == 16
+    assert reloaded.rollout is not None and reloaded.rollout.n_modes == 16
+
+
+def test_torch_dynamo_eager_compile():
+    """Verify torch._dynamo traces KvNDSparkDraftModel.forward cleanly for Linux H200."""
+    torch.manual_seed(77)
+    cfg = _make_kvn_config(backbone_type="kvn", n_modes=16, block_size=4, num_layers=2)
+    model = KvNDSparkDraftModel(cfg)
+    _init_dummy_verifier_weights(model)
+
+    compiled_fn = torch.compile(model.forward, backend="eager")
+    seq_len = 24
+    hidden_states = torch.randn(1, seq_len, 3 * 64)
+    input_ids = torch.randint(0, 128, (1, seq_len))
+    loss_mask = torch.ones(1, seq_len, dtype=torch.bool)
+    verifier_last_hs = torch.randn(1, seq_len, 64)
+    document_ids = torch.zeros(1, seq_len, dtype=torch.long)
+
+    _, loss, metrics = compiled_fn(
+        hidden_states=hidden_states,
+        input_ids=input_ids,
+        loss_mask=loss_mask,
+        verifier_last_hidden_states=verifier_last_hs,
+        document_ids=document_ids,
+        max_anchors=3,
+    )
+    assert torch.isfinite(loss)
+    loss.backward()

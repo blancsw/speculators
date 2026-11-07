@@ -227,6 +227,8 @@ def apply_fully_sharded(
 
     for layer in model.layers:  # type: ignore[union-attr]
         fully_shard(layer, mp_policy=mp_policy, ignored_params=ignored_params)
+    for layer in getattr(model, "kvn_layers", ()):
+        fully_shard(layer, mp_policy=mp_policy, ignored_params=ignored_params)
 
     fully_shard(model, mp_policy=mp_policy, ignored_params=ignored_params)
 

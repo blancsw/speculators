@@ -15,7 +15,10 @@ set -euo pipefail
 # ============ Configuration ============
 MODEL="${MODEL:-Qwen/Qwen3-8B}"
 TARGET_LAYER_IDS="${TARGET_LAYER_IDS:-2 18 33}"
-DATASET="${DATASET:-./ultrachat_qwen3.jsonl}"
+# Pure Online Mode:
+# - Default: "hf:inference-optimization/speculators-ci-datasets:tutorial_regen" (pretokenized Qwen3-8B UltraChat on HF Hub)
+# - Or set DATASET="ultrachat" or DATASET="sharegpt" to render & tokenize online via the live vLLM server on GPU 0
+DATASET="${DATASET:-hf:inference-optimization/speculators-ci-datasets:tutorial_regen}"
 OUTPUT_DIR="${OUTPUT_DIR:-./output/kvn_dspark_qwen3}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 MAX_SAMPLES="${MAX_SAMPLES:-50000}"
@@ -46,17 +49,7 @@ TRAIN_GPUS="1"
 NUM_TRAIN_GPUS=1
 # =======================================
 
-# Step 0: Regenerate target responses if dataset JSONL does not exist yet
-if [[ ! -f "$DATASET" ]]; then
-    echo "=== Step 0: Regenerating target responses with vLLM on GPU $VLLM_GPUS ==="
-    bash scripts/response_regeneration/run_all.sh \
-        --model "$MODEL" --dataset ultrachat \
-        --gpus "$VLLM_GPUS" --port "$VLLM_PORT" \
-        --limit "$MAX_SAMPLES" --max-tokens "$SEQ_LENGTH" \
-        --outfile "$DATASET" --resume
-fi
-
-# Step 1: Launch vLLM server on H200 GPU 0
+# Step 1: Launch live vLLM server on H200 GPU 0 (generates hidden states online in /dev/shm)
 echo "=== Step 1: Launching vLLM server on GPU $VLLM_GPUS ($MODEL) ==="
 CUDA_VISIBLE_DEVICES="$VLLM_GPUS" python scripts/launch_vllm.py "$MODEL" \
     --target-layer-ids $TARGET_LAYER_IDS \
@@ -76,16 +69,26 @@ until curl -sf "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; do
 done
 echo "vLLM server ready."
 
-# Step 2: Prepare data & token frequency distribution
-echo "=== Step 2: Preparing dataset in $OUTPUT_DIR ==="
-speculators prepare-data \
-    --model "$MODEL" \
-    --data "$DATASET" \
-    --output "$OUTPUT_DIR" \
-    --max-samples "$MAX_SAMPLES" \
-    --seq-length "$SEQ_LENGTH" \
-    --no-skip-token-freq \
-    --render-endpoint "http://localhost:${VLLM_PORT}"
+# Step 2: Prepare token IDs & token frequency distribution (no hidden states written to disk)
+echo "=== Step 2: Preparing token dataset ($DATASET) in $OUTPUT_DIR ==="
+if [[ "$DATASET" == hf:* ]]; then
+    speculators prepare-data \
+        --model "$MODEL" \
+        --data "$DATASET" \
+        --output "$OUTPUT_DIR" \
+        --max-samples "$MAX_SAMPLES" \
+        --seq-length "$SEQ_LENGTH" \
+        --no-skip-token-freq
+else
+    speculators prepare-data \
+        --model "$MODEL" \
+        --data "$DATASET" \
+        --output "$OUTPUT_DIR" \
+        --max-samples "$MAX_SAMPLES" \
+        --seq-length "$SEQ_LENGTH" \
+        --no-skip-token-freq \
+        --render-endpoint "http://localhost:${VLLM_PORT}"
+fi
 
 # Step 3: Train KvN-DSpark on H200 GPU 1
 echo "=== Step 3: Training KvN-DSpark (M_train=${KVN_N_MODES_TRAIN}, backbone=${KVN_BACKBONE_TYPE}) ==="
@@ -127,11 +130,15 @@ if [[ "$KVN_BACKBONE_TYPE" != "swa" && "$KVN_N_MODES_INFER" -lt "$KVN_N_MODES_TR
     CKPT_PATH="$OUTPUT_DIR/checkpoints/$LAST_EPOCH"
     PRUNED_PATH="$OUTPUT_DIR/checkpoints/pruned_m${KVN_N_MODES_INFER}"
     python -c "
+from pathlib import Path
 import torch
 from speculators.models.kvn_dspark import KvNDSparkDraftModel
+from speculators.train.checkpointer import convert_float_dtype, patch_config_dtype
 model = KvNDSparkDraftModel.from_pretrained('$CKPT_PATH')
 model.prune_kvn_modes($KVN_N_MODES_INFER)
-model.save_pretrained('$PRUNED_PATH')
+sd = convert_float_dtype(model.state_dict(), torch.bfloat16)
+model.save_pretrained('$PRUNED_PATH', state_dict=sd)
+patch_config_dtype(Path('$PRUNED_PATH') / 'config.json', torch.bfloat16)
 print('Saved pruned Zero-KV checkpoint to:', '$PRUNED_PATH', 'State bytes/seq:', model.config.estimated_state_bytes_per_seq())
 "
 fi

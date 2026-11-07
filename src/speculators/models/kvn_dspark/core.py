@@ -194,10 +194,14 @@ class KvNDSparkDraftModel(DSparkDraftModel):
         return dict(shared), dict(shared)
 
     def total_lasso_penalty(self) -> torch.Tensor:
-        """Compute Barthe Theorem 5.6 LASSO L1 penalty across all KvN-RFF layers."""
+        """Compute Barthe Theorem 5.6 Group-LASSO + L1 penalty across all KvN-RFF readouts."""
         if not self.kvn_layers or self.config.kvn_lasso_weight <= 0.0:
             return torch.tensor(0.0, device=self.fc.weight.device)
         pen = sum(layer.lasso_penalty() for layer in self.kvn_layers)
+        if self.rollout is not None:
+            pen = pen + self.rollout.lasso_penalty()
+        if self.born_confidence_head is not None:
+            pen = pen + self.born_confidence_head.lasso_penalty()
         return self.config.kvn_lasso_weight * pen
 
     @torch.no_grad()
@@ -206,18 +210,41 @@ class KvNDSparkDraftModel(DSparkDraftModel):
         if not self.kvn_layers:
             return
         last_top_idx: torch.Tensor | None = None
-        for layer in self.kvn_layers:
-            last_top_idx = layer.prune_to_top_modes(target_modes)
+        num_kvn = len(self.kvn_layers)
+        for idx, layer in enumerate(self.kvn_layers):
+            extra_imp: torch.Tensor | None = None
+            if idx == num_kvn - 1:
+                if self.rollout is not None:
+                    extra_imp = self.rollout.mode_importance()
+                if self.born_confidence_head is not None:
+                    born_imp = self.born_confidence_head.mode_importance()
+                    if born_imp is not None:
+                        extra_imp = (
+                            born_imp
+                            if extra_imp is None
+                            else extra_imp + born_imp.to(extra_imp.device)
+                        )
+            last_top_idx = layer.prune_to_top_modes(
+                target_modes, extra_importance=extra_imp
+            )
         if last_top_idx is not None and self.rollout is not None:
             self.rollout.prune_to_indices(last_top_idx)
             if self.born_confidence_head is not None:
                 self.born_confidence_head.prune_born_modes(last_top_idx)
         self.config.kvn_n_modes = target_modes
 
+    @torch.compiler.disable
+    def _select_kvn_anchors(
+        self, loss_mask: torch.Tensor, max_anchors: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Select valid anchors outside torch.compile to avoid data-dependent nonzero shapes."""
+        return select_anchors(loss_mask, max_anchors, self.block_size)
+
     def _compute_targets_and_mask(
         self,
         verifier_last_hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
+        document_ids: torch.Tensor,
         anchor_positions: torch.Tensor,
         anchor_valid: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -245,10 +272,18 @@ class KvNDSparkDraftModel(DSparkDraftModel):
                 targets = verifier_logits[:, anchored_block_indices]
 
         aligned_loss_mask = loss_mask.clone()[:, anchored_block_indices]
-        aligned_loss_mask = aligned_loss_mask * (
-            anchor_valid.repeat_interleave(self.block_size)
-            .unsqueeze(0)
-            .to(aligned_loss_mask.dtype)
+        same_doc_mask = (
+            document_ids[:, anchored_block_indices]
+            == document_ids[:, anchor_positions].repeat_interleave(self.block_size, dim=1)
+        )
+        aligned_loss_mask = (
+            aligned_loss_mask
+            * same_doc_mask.to(aligned_loss_mask.dtype)
+            * (
+                anchor_valid.repeat_interleave(self.block_size)
+                .unsqueeze(0)
+                .to(aligned_loss_mask.dtype)
+            )
         )
         if not self.config.sample_from_anchor:
             aligned_loss_mask[:, :: self.block_size] = 0
@@ -342,8 +377,8 @@ class KvNDSparkDraftModel(DSparkDraftModel):
             swa_blocks = noise_embedding.view(max_anchors, self.block_size, -1)
         else:
             # 100% Zero-KV Pure KvN-RFF path (no SWA attention mask or KV cache)
-            anchor_positions, anchor_valid = select_anchors(
-                loss_mask, max_anchors, self.block_size
+            anchor_positions, anchor_valid = self._select_kvn_anchors(
+                loss_mask, max_anchors
             )
             fc_output = self.hidden_norm(self.fc(hidden_states))
             swa_blocks = None
@@ -352,6 +387,7 @@ class KvNDSparkDraftModel(DSparkDraftModel):
             self._compute_targets_and_mask(
                 verifier_last_hidden_states=verifier_last_hidden_states,
                 loss_mask=loss_mask,
+                document_ids=document_ids,
                 anchor_positions=anchor_positions,
                 anchor_valid=anchor_valid,
             )
