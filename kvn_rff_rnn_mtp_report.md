@@ -205,9 +205,19 @@ The `NVIDIA H200` has a **`50 MB` L2 cache**.
    - Reduces confidence calibration error (`ConfMAE`) by **`-33.6%`** (`0.2790 -> 0.1852`) and cumulative product bias by **`-82.6%`** (`+0.1100 -> +0.0191`) via Barthe's amplified Born-rule energy observable.
    - Delivers **`3.34×` faster raw block drafting** (`3.661 ms` vs. `12.223 ms`) and **`4.15×` higher effective accepted tokens/second** at batch size $B=128$ on `NVIDIA H200`.
 
-### Saved Reproducibility Artifacts in Repository
+### Saved Reproducibility Artifacts & Published Hugging Face Models
+- **KvN-RFF-RNN Exploration & Physics Research Repository:** [https://github.com/blancsw/KvN-RFF-RNN](https://github.com/blancsw/KvN-RFF-RNN)
+- **Speculators KvN-RFF-RNN MTP Implementation (`kvn-rff-rnn-mtp` branch):** [https://github.com/blancsw/speculators/tree/kvn-rff-rnn-mtp](https://github.com/blancsw/speculators/tree/kvn-rff-rnn-mtp)
 - **Model Implementation:** [`src/speculators/models/kvn_dspark/`](./src/speculators/models/kvn_dspark/) (`config.py`, `core.py`, `model_definitions.py`)
 - **Unit Test Suite (11/11 Passing):** [`tests/unit/models/test_kvn_dspark.py`](./tests/unit/models/test_kvn_dspark.py)
 - **H200 Raw Benchmark & Epoch Metrics JSON:** [`kvn_rff_mtp/h200_qwen3_8b_ablation_results.json`](./kvn_rff_mtp/h200_qwen3_8b_ablation_results.json)
 - **RTX 3070 Ti Reference Validation JSON:** [`kvn_rff_mtp/rtx3070ti_qwen3_validation_results.json`](./kvn_rff_mtp/rtx3070ti_qwen3_validation_results.json)
 - **Training & Benchmark Guide:** [`kvn_rff_rnn_mtp_train.md`](./kvn_rff_rnn_mtp_train.md)
+
+| Ablation Variant | Hugging Face Hub Repository (`Infomaniak-AI`) | Backbone | State / KV Cache | Expected Accept Len ($\tau$) | Greedy EAL |
+| :--- | :--- | :--- | :---: | :---: | :---: |
+| **`M3` (Flagship Zero-KV)** | [**Infomaniak-AI/Qwen3-8B-speculator.kvn-dspark**](https://huggingface.co/Infomaniak-AI/Qwen3-8B-speculator.kvn-dspark) | `5× KvN-RFF (M=128)` | **`2.56 KB` (`-99.976%`)** | **`2.3607` (`+24.1%`)** | **`2.4591` (`+24.3%`)** |
+| **`M4-Pruned` (LASSO $512 \to 128$)** | [**Infomaniak-AI/Qwen3-8B-speculator.kvn-dspark-lasso128**](https://huggingface.co/Infomaniak-AI/Qwen3-8B-speculator.kvn-dspark-lasso128) | `5× KvN-RFF (512->128)` | **`2.56 KB` (`-99.976%`)** | `2.2760` (`+19.7%`) | `2.3760` (`+20.1%`) |
+| **`M4` (Wide $M=512$)** | [**Infomaniak-AI/Qwen3-8B-speculator.kvn-dspark-m512**](https://huggingface.co/Infomaniak-AI/Qwen3-8B-speculator.kvn-dspark-m512) | `5× KvN-RFF (M=512)` | `10.24 KB` (`-99.902%`) | `2.2678` (`+19.2%`) | `2.3696` (`+19.8%`) |
+| **`M2` (Hybrid)** | [**Infomaniak-AI/Qwen3-8B-speculator.kvn-dspark-hybrid**](https://huggingface.co/Infomaniak-AI/Qwen3-8B-speculator.kvn-dspark-hybrid) | `1× SWA-128 + 4× KvN` | `2.10 MB` (`-80.0%`) | `2.2440` (`+18.0%`) | `2.3500` (`+18.8%`) |
+| **`M1` (DSpark Baseline)** | [**Infomaniak-AI/Qwen3-8B-speculator.dspark-swa**](https://huggingface.co/Infomaniak-AI/Qwen3-8B-speculator.dspark-swa) | `5× SWA-128` | `10.49 MB` (Baseline) | `1.9020` (Baseline) | `1.9780` (Baseline) |
