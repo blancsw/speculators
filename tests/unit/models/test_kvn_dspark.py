@@ -339,7 +339,8 @@ def test_torch_dynamo_eager_compile():
     model = KvNDSparkDraftModel(cfg)
     _init_dummy_verifier_weights(model)
 
-    compiled_fn = torch.compile(model.forward, backend="eager")
+    raw_fn = getattr(KvNDSparkDraftModel.forward, "__wrapped__", KvNDSparkDraftModel.forward)
+    compiled_fn = torch.compile(raw_fn.__get__(model, KvNDSparkDraftModel), backend="eager")
     seq_len = 24
     hidden_states = torch.randn(1, seq_len, 3 * 64)
     input_ids = torch.randint(0, 128, (1, seq_len))

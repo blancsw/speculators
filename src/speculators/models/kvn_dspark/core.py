@@ -31,8 +31,22 @@ from speculators.models.kvn_dspark.model_definitions import (
 from speculators.models.utils import conditional_torch_compile
 
 _HAS_TRITON = importlib.util.find_spec("triton") is not None
-_DEFAULT_KL_FN = kl_div_loss if _HAS_TRITON else eager_losses.kl_div_loss
-_DEFAULT_TV_FN = tv_loss if _HAS_TRITON else eager_losses.tv_loss
+
+
+def _default_kl_fn(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    if _HAS_TRITON and logits.is_cuda:
+        return kl_div_loss(logits, targets)
+    return eager_losses.kl_div_loss(logits, targets)
+
+
+def _default_tv_fn(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    if _HAS_TRITON and logits.is_cuda:
+        return tv_loss(logits, targets)
+    return eager_losses.tv_loss(logits, targets)
+
+
+_DEFAULT_KL_FN = _default_kl_fn
+_DEFAULT_TV_FN = _default_tv_fn
 _DEFAULT_LOSS_CONFIG: LossConfig = {"kl_div": (_DEFAULT_KL_FN, 1.0)}
 
 __all__ = [
