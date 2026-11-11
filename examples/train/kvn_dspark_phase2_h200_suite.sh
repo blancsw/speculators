@@ -39,6 +39,8 @@ NPROC="${NPROC:-1}"
 
 DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32768}"
 SEQ_LENGTH="${SEQ_LENGTH:-8192}"
+# Keep vLLM context strictly > SEQ_LENGTH so /render and /chat/completions never hit HTTP 400 (max_tokens >= 1)
+VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-$((SEQ_LENGTH + 4096))}"
 EPOCHS="${EPOCHS:-6}"
 TRAIN_DATA_RATIO="${TRAIN_DATA_RATIO:-0.95}"
 SKIP_DATA_PREP="${SKIP_DATA_PREP:-0}"
@@ -136,7 +138,7 @@ emit_train_argv() {
                 --kvn-backbone-type kvn
                 --kvn-n-modes 128
                 --kvn-reupload-layers 2
-                --kvn-reupload-dim 4096
+                --kvn-reupload-dim 0
                 --no-kvn-learnable-rff
                 --kvn-anchor-rank 0
                 --no-kvn-enable-interferometer
@@ -286,13 +288,13 @@ cleanup() {
 trap cleanup EXIT
 
 # ==============================================================================
-# Phase B: Launch vLLM Hidden-State Producer + Build Decontaminated 68k Dataset
+# Phase B: Launch vLLM Hidden-State Producer + Build Decontaminated 100k Dataset
 # ==============================================================================
 echo "=== Phase B.1: Launching vLLM server on GPUs ${VLLM_GPUS} (${VERIFIER_MODEL}) ==="
 CUDA_VISIBLE_DEVICES="$VLLM_GPUS" python scripts/launch_vllm.py "$VERIFIER_MODEL" \
     --target-layer-ids $TARGET_LAYER_IDS \
     --hidden-states-path "$HS_CACHE_DIR" \
-    -- --data-parallel-size "$VLLM_DP" --port "$VLLM_PORT" --max-model-len "$SEQ_LENGTH" --gpu-memory-utilization 0.88 &
+    -- --data-parallel-size "$VLLM_DP" --port "$VLLM_PORT" --max-model-len "$VLLM_MAX_MODEL_LEN" --gpu-memory-utilization 0.88 &
 VLLM_PID=$!
 
 until curl -sf "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; do
@@ -311,9 +313,10 @@ if [[ "$SKIP_DATA_PREP" != "1" ]]; then
             --magicoder-samples "$MAGICODER_SAMPLES" \
             --exclude-benchmarks mt_bench gsm8k math500 humaneval mbpp livecodebench \
             --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
-            --concurrency 64 \
+            --concurrency "$((64 * VLLM_DP))" \
             --output-jsonl "$RAW_JSONL" \
             --val-samples 0 \
+            --resume \
             --seed 42
     fi
 

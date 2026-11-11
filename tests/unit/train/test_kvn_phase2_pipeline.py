@@ -135,6 +135,183 @@ def test_domain_normalizers_and_stratified_temperature_assignment():
     assert parsed.val_samples == 5_000
 
 
+def test_livecodebench_fallback_and_token_exact_on_policy_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import json
+    import datasets
+    import huggingface_hub
+
+    mod = _load_script_module(
+        "build_decontaminated_mix", "scripts/build_decontaminated_mix.py"
+    )
+
+    # 1. Verify livecodebench script-less fallback when load_dataset rejects legacy scripts
+    fake_lcb = tmp_path / "test_lcb.jsonl"
+    fake_lcb.write_text(
+        json.dumps(
+            {
+                "question_content": "Given a directed acyclic graph compute the longest topological path modulo prime p."
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    orig_load_dataset = datasets.load_dataset
+
+    def _fake_load_dataset(path, *args, **kwargs):
+        if path == "livecodebench/code_generation_lite":
+            raise RuntimeError(
+                "Dataset scripts are no longer supported, but found code_generation_lite.py"
+            )
+        return orig_load_dataset(path, *args, **kwargs)
+
+    monkeypatch.setattr(datasets, "load_dataset", _fake_load_dataset)
+    monkeypatch.setattr(
+        huggingface_hub,
+        "list_repo_files",
+        lambda repo_id, repo_type=None: ["test.jsonl", "README.md"],
+    )
+    monkeypatch.setattr(
+        huggingface_hub,
+        "hf_hub_download",
+        lambda repo_id, filename, repo_type=None: str(fake_lcb),
+    )
+
+    idx = mod.load_benchmark_index(["livecodebench"], ngram_size=13)
+    leaked, reason = idx.is_contaminated(
+        [
+            {
+                "role": "user",
+                "content": "Given a directed acyclic graph compute the longest topological path modulo prime p.",
+            }
+        ]
+    )
+    assert leaked is True and "livecodebench" in reason
+
+    # 2. Verify token-exact boundary rows (input_ids + loss_mask), exact target_count replacement
+    #    after post-generation 13-gram rejection, and --resume idempotency
+    fake_stream = [
+        # Multi-turn conversation (2 assistant turns -> 2 boundary rows; 2nd turn leaks -> rejected!)
+        {
+            "messages": [
+                {"role": "user", "content": "Explain damped harmonic oscillators."},
+                {"role": "assistant", "content": "orig 1"},
+                {"role": "user", "content": "Give a graph problem."},
+                {"role": "assistant", "content": "orig 2"},
+            ]
+        },
+        {
+            "messages": [
+                {"role": "user", "content": "Derive Bochner theorem for Gaussian kernels."},
+                {"role": "assistant", "content": "orig 3"},
+            ]
+        },
+        {
+            "messages": [
+                {"role": "user", "content": "Show how symplectic integrators conserve energy."},
+                {"role": "assistant", "content": "orig 4"},
+            ]
+        },
+    ]
+
+    monkeypatch.setattr(
+        datasets,
+        "load_dataset",
+        lambda *a, **kw: datasets.Dataset.from_list(fake_stream),
+    )
+
+    call_counter = {"n": 0}
+
+    async def _fake_post_chat_completion(
+        session, endpoint, model, messages, temperature, max_tokens, timeout_s=300.0
+    ):
+        call_counter["n"] += 1
+        last_user = messages[-1]["content"]
+        if "graph problem" in last_user:
+            # Post-generation 13-gram leak -> must be rejected and replaced!
+            reply = "Try this: Given a directed acyclic graph compute the longest topological path modulo prime p."
+            comp_ids = [21, 22, 23]
+        else:
+            reply = f"Clean on-policy response #{call_counter['n']}"
+            comp_ids = [30 + call_counter["n"], 40 + call_counter["n"]]
+        prompt_ids = [10, 11, 12]
+        return {
+            "prompt_token_ids": prompt_ids,
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": reply},
+                    "token_ids": comp_ids,
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(mod, "_post_chat_completion_async", _fake_post_chat_completion)
+
+    out_jsonl = tmp_path / "mix.jsonl"
+    mod.main(
+        [
+            "--verifier-model",
+            "Qwen/Qwen3-8B",
+            "--ultrachat-samples",
+            "3",
+            "--openmath-samples",
+            "0",
+            "--magicoder-samples",
+            "0",
+            "--exclude-benchmarks",
+            "livecodebench",
+            "--vllm-endpoint",
+            "http://localhost:8000/v1",
+            "--output-jsonl",
+            str(out_jsonl),
+            "--val-samples",
+            "0",
+            "--resume",
+        ]
+    )
+
+    written = [
+        json.loads(line)
+        for line in out_jsonl.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    # Exact target_count = 3 clean boundary rows despite 1 post-gen 13-gram leak!
+    assert len(written) == 3
+    for row in written:
+        assert "input_ids" in row and "loss_mask" in row
+        assert len(row["input_ids"]) == len(row["loss_mask"]) == 5
+        assert row["loss_mask"] == [0, 0, 0, 1, 1]
+
+    # Re-running with --resume when partial cache already has 3 clean rows makes 0 new LLM calls
+    prev_calls = call_counter["n"]
+    out_jsonl_resume = tmp_path / "mix.jsonl"
+    mod.main(
+        [
+            "--verifier-model",
+            "Qwen/Qwen3-8B",
+            "--ultrachat-samples",
+            "3",
+            "--openmath-samples",
+            "0",
+            "--magicoder-samples",
+            "0",
+            "--exclude-benchmarks",
+            "livecodebench",
+            "--vllm-endpoint",
+            "http://localhost:8000/v1",
+            "--output-jsonl",
+            str(out_jsonl_resume),
+            "--val-samples",
+            "0",
+            "--resume",
+        ]
+    )
+    assert call_counter["n"] == prev_calls
+
+
 # --------------------------------------------------------------------------- #
 # Phase D: Calibration (ECE, AUROC, Dynamic Stopping Pareto) & Amdahl Metrics
 # --------------------------------------------------------------------------- #
@@ -305,6 +482,135 @@ def test_evaluate_checkpoint_calibration_end_to_end_cpu(tmp_path: Path):
     assert len(report["dynamic_stopping_pareto"]) == 6
 
 
+def test_online_arrow_calibration_fallback_and_exact_e2e_spec_decoding(tmp_path: Path):
+    """Verify online-mode calibration (no hidden_states/ dir) and lossless E2E speculative decoding for kvn & swa."""
+    from datasets import Dataset
+    from transformers import Qwen3ForCausalLM
+    from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+    from speculators.config import SpeculatorsConfig, VerifierConfig
+    from speculators.models.kvn_dspark import (
+        KvNDSparkDraftModel,
+        KvNDSparkSpeculatorConfig,
+    )
+    from speculators.proposals.greedy import GreedyTokenProposalConfig
+
+    eval_mod = _load_script_module(
+        "kvn_phase2_calibration_and_amdahl",
+        "scripts/evaluate/kvn_phase2_calibration_and_amdahl.py",
+    )
+
+    torch.manual_seed(777)
+    vocab_size = 48
+    draft_vocab_size = 32
+    hidden_size = 32
+    layer_cfg = Qwen3Config(
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        sliding_window=16,
+        use_sliding_window=True,
+        layer_types=["sliding_attention", "sliding_attention"],
+        _attn_implementation="eager",
+    )
+    verifier = Qwen3ForCausalLM(layer_cfg).eval()
+    verifier_dir = tmp_path / "verifier"
+    verifier.save_pretrained(verifier_dir)
+
+    # Save an online-mode Arrow dataset WITHOUT any data_dir/hidden_states/ directory
+    online_data_dir = tmp_path / "online_arrow_data"
+    rows = [
+        {
+            "input_ids": torch.randint(1, draft_vocab_size, (24,)).tolist(),
+            "loss_mask": [False] * 4 + [True] * 20,
+            "seq_len": 24,
+        }
+        for _ in range(10)
+    ]
+    Dataset.from_list(rows).with_format("torch").save_to_disk(str(online_data_dir))
+    assert not (online_data_dir / "hidden_states").exists()
+
+    d2t = torch.zeros(draft_vocab_size, dtype=torch.long)
+    t2d = torch.zeros(vocab_size, dtype=torch.bool)
+    t2d[:draft_vocab_size] = True
+
+    for backbone in ("kvn", "swa"):
+        cfg = KvNDSparkSpeculatorConfig(
+            transformer_layer_config=layer_cfg,
+            draft_vocab_size=draft_vocab_size,
+            block_size=4,
+            aux_hidden_state_layer_ids=[0, 1],
+            mask_token_id=0,
+            markov_rank=16,
+            markov_head_type="gated",
+            enable_confidence_head=True,
+            confidence_head_with_markov=True,
+            kvn_backbone_type=backbone,  # type: ignore[arg-type]
+            kvn_n_modes=16,
+            kvn_reupload_layers=2,
+            kvn_reupload_dim=16,
+            kvn_anchor_rank=16,
+            kvn_use_born_confidence=(backbone == "kvn"),
+            speculators_config=SpeculatorsConfig(
+                algorithm="kvn_dspark",
+                proposal_methods=[GreedyTokenProposalConfig()],
+                default_proposal_method="greedy",
+                verifier=VerifierConfig(
+                    name_or_path=str(verifier_dir), architectures=["Qwen3ForCausalLM"]
+                ),
+            ),
+        )
+        model = KvNDSparkDraftModel(config=cfg)
+        model.load_vocab_mappings(t2d, d2t)
+        model.load_verifier_weights()
+        ckpt_dir = tmp_path / f"ckpt_{backbone}"
+        model.save_pretrained(ckpt_dir)
+
+        if backbone == "kvn":
+            cal_report = eval_mod.evaluate_checkpoint_calibration(
+                checkpoint_dir=ckpt_dir,
+                verifier_model=str(verifier_dir),
+                data_dir=online_data_dir,
+                draft_vocab_size=draft_vocab_size,
+                max_samples=2,
+                train_data_ratio=0.8,
+                device="cpu",
+            )
+            assert cal_report["num_evaluated_blocks"] > 0
+            assert 0.0 <= cal_report["overall_ece_15bin"] <= 1.0
+
+        prompt_ids = [[2, 5, 7, 11, 13], [3, 6, 9, 12, 15]]
+        e2e_greedy = eval_mod.evaluate_checkpoint_e2e(
+            checkpoint_dir=ckpt_dir,
+            verifier_model=str(verifier_dir),
+            prompt_token_ids_list=prompt_ids,
+            max_new_tokens=10,
+            temperature=0.0,
+            batch_sizes=[1, 2],
+            device="cpu",
+        )
+        assert e2e_greedy["exact_greedy_match_all_prompts"] is True
+        assert e2e_greedy["mean_accept_len_tau"] >= 1.0
+        assert "1" in e2e_greedy["amdahl_by_batch_size"]
+        assert "2" in e2e_greedy["amdahl_by_batch_size"]
+        assert e2e_greedy["amdahl_by_batch_size"]["1"]["e2e_speedup"] > 0.0
+
+        if backbone == "kvn":
+            e2e_stoch = eval_mod.evaluate_checkpoint_e2e(
+                checkpoint_dir=ckpt_dir,
+                verifier_model=str(verifier_dir),
+                prompt_token_ids_list=prompt_ids[:1],
+                max_new_tokens=8,
+                temperature=0.6,
+                batch_sizes=[1],
+                device="cpu",
+            )
+            assert e2e_stoch["mean_accept_len_tau"] >= 1.0
+
+
 # --------------------------------------------------------------------------- #
 # Phase C: H200 Suite & Recipe CLI Resolution Guard (Zero ConfigError/Warnings)
 # --------------------------------------------------------------------------- #
@@ -424,7 +730,24 @@ def test_h200_shell_scripts_syntax_and_all_11_configs_resolve_cleanly():
         if model_id == "A5_KvN_v2_Pruned128_Recal":
             assert flat["from_pretrained"] is not None
             assert flat["epochs"] == 1
+            assert flat["kvn_lasso_weight"] == pytest.approx(0.0)
         else:
             assert flat["num_layers"] == 5
             assert flat["draft_vocab_size"] == 32768
             assert flat["epochs"] == 6
+            if model_id == "A0_KvN_v1_CausalFix":
+                assert flat["kvn_reupload_dim"] == 0
+
+    # 3. Pre-flight ISO guards on vLLM --max-model-len (> SEQ_LENGTH) and Phase D eval script
+    assert "VLLM_MAX_MODEL_LEN" in online_text
+    assert '--max-model-len "$SEQ_LENGTH"' not in online_text
+    assert "VLLM_MAX_MODEL_LEN" in suite_text
+    assert '--max-model-len "$SEQ_LENGTH"' not in suite_text
+
+    eval_text = (
+        REPO_ROOT / "examples" / "evaluate" / "kvn_dspark_phase2_e2e_eval.sh"
+    ).read_text(encoding="utf-8")
+    assert "benchmark-e2e" in eval_text
+    assert "calibrate" in eval_text
+    assert 'if [[ -d "${DATA_DIR}/hidden_states" ]]; then' not in eval_text
+    assert 'vllm serve "$model_path"' not in eval_text

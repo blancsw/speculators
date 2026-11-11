@@ -7,7 +7,7 @@
 #
 # Base Verifier LLMs supported out-of-the-box on 2xH200:
 #   - Standard Speculators Benchmark: MODEL="Qwen/Qwen3-8B"   (TARGET_LAYER_IDS="2 18 33")
-#   - High-Capacity H200 Scale-Up:    MODEL="Qwen/Qwen3-32B"  (TARGET_LAYER_IDS="4 32 60")
+#   - High-Capacity H200 Scale-Up:    MODEL="Qwen/Qwen3-32B"  (TARGET_LAYER_IDS="2 32 61")
 # ==============================================================================
 
 set -euo pipefail
@@ -27,10 +27,12 @@ OPENMATH_SAMPLES="${OPENMATH_SAMPLES:-$((MAX_SAMPLES * 32 / 100))}"
 MAGICODER_SAMPLES="${MAGICODER_SAMPLES:-$((MAX_SAMPLES - ULTRACHAT_SAMPLES - OPENMATH_SAMPLES))}"
 TRAIN_DATA_RATIO="${TRAIN_DATA_RATIO:-0.95}"
 SEQ_LENGTH="${SEQ_LENGTH:-8192}"
+VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-$((SEQ_LENGTH + 4096))}"
 EPOCHS="${EPOCHS:-6}"
 RECAL_EPOCHS="${RECAL_EPOCHS:-1}"
 LR="${LR:-3e-4}"
 MUON_LR="${MUON_LR:-2e-3}"
+SEED="${SEED:-42}"
 
 # KvN-DSpark v2 Architecture & Dyadic Group-LASSO Scaling (M_train -> M_infer)
 SPECULATOR_TYPE="kvn_dspark"
@@ -45,16 +47,18 @@ KVN_LASSO_WEIGHT="${KVN_LASSO_WEIGHT:-3e-4}"
 BLOCK_SIZE=8
 MAX_ANCHORS=512
 NUM_LAYERS=5
+SLIDING_WINDOW=128
 DRAFT_VOCAB_SIZE=32768
 MARKOV_RANK=256
 MARKOV_HEAD_TYPE="gated"
 LOSS_FN='{"ce": 0.1, "tv": 0.9}'
 CONFIDENCE_HEAD_ALPHA=1.0
+NUM_WORKERS=8
 
 # 2xH200 GPU Assignment
-VLLM_GPUS="0"
-TRAIN_GPUS="1"
-NUM_TRAIN_GPUS=1
+VLLM_GPUS="${VLLM_GPUS:-0}"
+TRAIN_GPUS="${TRAIN_GPUS:-1}"
+NUM_TRAIN_GPUS="${NUM_TRAIN_GPUS:-1}"
 # =======================================
 
 mkdir -p "$OUTPUT_DIR" "$HS_CACHE_DIR"
@@ -64,7 +68,7 @@ echo "=== Step 1: Launching vLLM server on GPU $VLLM_GPUS ($MODEL) ==="
 CUDA_VISIBLE_DEVICES="$VLLM_GPUS" python scripts/launch_vllm.py "$MODEL" \
     --target-layer-ids $TARGET_LAYER_IDS \
     --hidden-states-path "$HS_CACHE_DIR" \
-    -- --port "$VLLM_PORT" --max-model-len "$SEQ_LENGTH" --gpu-memory-utilization 0.85 &
+    -- --port "$VLLM_PORT" --max-model-len "$VLLM_MAX_MODEL_LEN" --gpu-memory-utilization 0.88 &
 VLLM_PID=$!
 
 cleanup() {
@@ -95,7 +99,8 @@ if [[ -z "$DATASET" ]]; then
             --concurrency 64 \
             --output-jsonl "$DATASET" \
             --val-samples 0 \
-            --seed 42
+            --resume \
+            --seed "$SEED"
     fi
 fi
 
@@ -136,11 +141,13 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" torchrun \
     --muon-lr "$MUON_LR" \
     --optimizer muon \
     --scheduler-type cosine \
+    --loss-implementation fused \
     --total-seq-len "$SEQ_LENGTH" \
     --speculator-type "$SPECULATOR_TYPE" \
     --block-size "$BLOCK_SIZE" \
     --max-anchors "$MAX_ANCHORS" \
     --num-layers "$NUM_LAYERS" \
+    --sliding-window "$SLIDING_WINDOW" \
     --target-layer-ids $TARGET_LAYER_IDS \
     --markov-rank "$MARKOV_RANK" \
     --markov-head-type "$MARKOV_HEAD_TYPE" \
@@ -161,6 +168,9 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" torchrun \
     --kvn-strict-causal-shift \
     --kvn-lasso-weight "$KVN_LASSO_WEIGHT" \
     --kvn-use-born-confidence \
+    --num-workers "$NUM_WORKERS" \
+    --logger tensorboard \
+    --seed "$SEED" \
     --on-missing generate
 
 # Step 4: Exact Dyadic Group-LASSO Mode Pruning (M_train -> M_infer) + Optional 1-Epoch Recalibration
@@ -202,6 +212,7 @@ print('Saved Zero-Shot pruned checkpoint to:', '$PRUNED_PATH', 'State bytes/seq:
             --muon-lr 2e-4 \
             --optimizer muon \
             --scheduler-type cosine \
+            --loss-implementation fused \
             --total-seq-len "$SEQ_LENGTH" \
             --speculator-type "$SPECULATOR_TYPE" \
             --block-size "$BLOCK_SIZE" \
@@ -210,6 +221,9 @@ print('Saved Zero-Shot pruned checkpoint to:', '$PRUNED_PATH', 'State bytes/seq:
             --loss-fn "$LOSS_FN" \
             --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
             --kvn-lasso-weight 0.0 \
+            --num-workers "$NUM_WORKERS" \
+            --logger tensorboard \
+            --seed "$SEED" \
             --on-missing generate
     fi
 fi

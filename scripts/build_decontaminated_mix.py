@@ -7,20 +7,25 @@ Implements Phase B of ``kvn_rff_rnn_mtp_train_phase_2.md``:
    - ``nvidia/OpenMathInstruct-2`` (``train``, 32k / 14M): Long-horizon mathematical & CoT reasoning
    - ``ise-uiuc/Magicoder-OSS-Instruct-75K`` (``train``, 23k / 75.2k): Code generation & algorithmic structure
 2. Enforces **strict SHA-256 + normalized 13-gram decontamination** against downstream evaluation
-   benchmarks (MT-Bench, GSM8K test, MATH-500, HumanEval, MBPP, LiveCodeBench, plus any custom JSONL).
+   benchmarks (MT-Bench, GSM8K test, MATH-500, HumanEval, MBPP, LiveCodeBench, plus any custom JSONL),
+   with automatic JSONL fallback for Hugging Face repos whose legacy Python loading scripts are
+   deprecated under ``datasets >= 3.0`` (e.g. ``livecodebench/code_generation_lite``).
 3. Assigns stratified sampling temperatures matching the Phase 2 protocol:
    - UltraChat: 50% T=0.0 / 50% T=0.7
    - OpenMathInstruct-2: 50% T=0.0 / 50% T=0.6
    - Magicoder: 60% T=0.0 / 40% T=0.6
-4. Optionally regenerates every assistant turn **on-policy** against a live OpenAI-compatible
-   ``vLLM`` server (``--vllm-endpoint``) and re-runs 13-gram decontamination on generated completions
-   before writing ``speculators prepare-data``-ready JSONL files.
+4. Optionally regenerates assistant turns **on-policy** against a live OpenAI-compatible ``vLLM``
+   server (``--vllm-endpoint``) using pooled ``aiohttp`` + ``"return_token_ids": True`` to emit
+   **token-exact pretokenized ``(input_ids, loss_mask)`` boundary rows**, re-verifies generated
+   completions against 13-gram benchmark overlap, streams replacements until exact per-domain
+   row counts (45k / 32k / 23k = 100k) are reached, and supports crash-safe ``--resume``.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -28,8 +33,10 @@ import logging
 from pathlib import Path
 import random
 import re
+from typing import Any
 import unicodedata
-import urllib.request
+
+import aiohttp
 
 logger = logging.getLogger("build_decontaminated_mix")
 
@@ -39,7 +46,12 @@ _WORD_RE = re.compile(r"[a-z0-9]+")
 BENCHMARK_HF_SPECS: dict[str, tuple[str, str | None, str, tuple[str, ...]]] = {
     "gsm8k": ("openai/gsm8k", "main", "test", ("question", "answer")),
     "math500": ("HuggingFaceH4/MATH-500", None, "test", ("problem", "solution")),
-    "humaneval": ("openai/openai_humaneval", None, "test", ("prompt", "canonical_solution")),
+    "humaneval": (
+        "openai/openai_humaneval",
+        None,
+        "test",
+        ("prompt", "canonical_solution"),
+    ),
     "mbpp": ("google-research-datasets/mbpp", "sanitized", "test", ("prompt", "code")),
     "mt_bench": ("HuggingFaceH4/mt_bench_prompts", None, "train", ("prompt",)),
     "livecodebench": (
@@ -132,7 +144,10 @@ def normalize_domain_row(domain: str, row: dict) -> list[dict[str, str]] | None:
     if domain == "openmath":
         problem = str(row.get("problem") or row.get("question") or "").strip()
         solution = str(
-            row.get("generated_solution") or row.get("solution") or row.get("answer") or ""
+            row.get("generated_solution")
+            or row.get("solution")
+            or row.get("answer")
+            or ""
         ).strip()
         if not problem or not solution:
             return None
@@ -166,13 +181,31 @@ def assign_sampling_temperature(domain: str, sample_index: int) -> float:
     raise ValueError(f"Unsupported domain: {domain!r}")
 
 
+def _iter_hf_repo_jsonl_rows(hf_path: str) -> Iterator[dict[str, Any]]:
+    """Script-less fallback: download raw JSONL files directly via huggingface_hub."""
+    import huggingface_hub
+
+    repo_files = huggingface_hub.list_repo_files(hf_path, repo_type="dataset")
+    jsonl_files = sorted(f for f in repo_files if f.endswith(".jsonl"))
+    if not jsonl_files:
+        raise RuntimeError(f"No .jsonl files found in dataset repo {hf_path!r}")
+    for filename in jsonl_files:
+        local_path = huggingface_hub.hf_hub_download(
+            repo_id=hf_path, filename=filename, repo_type="dataset"
+        )
+        with Path(local_path).open(encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    yield json.loads(line)
+
+
 def load_benchmark_index(
     benchmarks: list[str],
     extra_jsonl_paths: list[Path] | None = None,
     ngram_size: int = 13,
 ) -> BenchmarkContaminationIndex:
     """Populate the decontamination index from Hugging Face test splits + optional local JSONLs."""
-    from datasets import load_dataset
+    import datasets
 
     index = BenchmarkContaminationIndex(ngram_size=ngram_size)
     for bench in benchmarks:
@@ -181,12 +214,21 @@ def load_benchmark_index(
             continue
         hf_path, subset, split, fields = BENCHMARK_HF_SPECS[bench]
         logger.info("Indexing benchmark %s (%s [%s])...", bench, hf_path, split)
-        ds = (
-            load_dataset(hf_path, subset, split=split)
-            if subset is not None
-            else load_dataset(hf_path, split=split)
-        )
-        for row in ds:
+        try:
+            ds_iter: Any = (
+                datasets.load_dataset(hf_path, subset, split=split)
+                if subset is not None
+                else datasets.load_dataset(hf_path, split=split)
+            )
+        except (RuntimeError, ValueError) as exc:
+            logger.warning(
+                "datasets.load_dataset failed for %s (%s); falling back to raw JSONL files.",
+                hf_path,
+                exc,
+            )
+            ds_iter = _iter_hf_repo_jsonl_rows(hf_path)
+
+        for row in ds_iter:
             for col in fields:
                 val = row.get(col)
                 if val:
@@ -211,80 +253,35 @@ def load_benchmark_index(
     return index
 
 
-def _chat_completion_sync(
-    endpoint: str,
-    model: str,
-    messages: list[dict[str, str]],
-    temperature: float,
-    max_tokens: int,
-    timeout_s: float = 300.0,
-) -> str:
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    if temperature == 0.0:
-        payload["top_p"] = 1.0
-    req = urllib.request.Request(  # noqa: S310
-        f"{endpoint.rstrip('/')}/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+def _iter_clean_domain_conversations(
+    domain: str,
+    index: BenchmarkContaminationIndex,
+    seed: int = 42,
+) -> Iterator[tuple[list[dict[str, str]], int]]:
+    """Yield ``(clean_conversation, cumulative_rejected_count)`` from the HF training split."""
+    import datasets
+
+    hf_path, subset, split = DOMAIN_HF_SPECS[domain]
+    ds = (
+        datasets.load_dataset(hf_path, subset, split=split, streaming=True)
+        if subset is not None
+        else datasets.load_dataset(hf_path, split=split, streaming=True)
     )
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310
-        body = json.loads(resp.read().decode("utf-8"))
-    return str(body["choices"][0]["message"]["content"]).strip()
+    if isinstance(ds, datasets.IterableDataset):
+        ds = ds.shuffle(seed=seed, buffer_size=10_000)
+    elif hasattr(ds, "shuffle"):
+        ds = ds.shuffle(seed=seed)
 
-
-async def regenerate_conversation_on_policy(
-    sem: asyncio.Semaphore,
-    endpoint: str,
-    model: str,
-    record: dict,
-    max_tokens: int,
-) -> dict | None:
-    """Regenerate every assistant turn sequentially using on-policy verifier completions."""
-    temperature = float(record["temperature"])
-    context: list[dict[str, str]] = []
-    async with sem:
-        for turn in record["conversations"]:
-            if turn["role"] != "assistant":
-                context.append(turn)
-                continue
-            try:
-                reply = await asyncio.to_thread(
-                    _chat_completion_sync,
-                    endpoint,
-                    model,
-                    list(context),
-                    temperature,
-                    max_tokens,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("On-policy generation failed (%s); dropping sample.", exc)
-                return None
-            if not reply:
-                return None
-            context.append({"role": "assistant", "content": reply})
-    return {**record, "conversations": context}
-
-
-async def regenerate_batch_async(
-    records: list[dict],
-    endpoint: str,
-    model: str,
-    concurrency: int = 64,
-    max_tokens: int = 4096,
-) -> list[dict]:
-    sem = asyncio.Semaphore(concurrency)
-    tasks = [
-        regenerate_conversation_on_policy(sem, endpoint, model, rec, max_tokens)
-        for rec in records
-    ]
-    completed = await asyncio.gather(*tasks)
-    return [r for r in completed if r is not None]
+    rejected = 0
+    for row in ds:
+        conv = normalize_domain_row(domain, row)
+        if conv is None:
+            continue
+        contaminated, _reason = index.is_contaminated(conv)
+        if contaminated:
+            rejected += 1
+            continue
+        yield conv, rejected
 
 
 def collect_decontaminated_domain_samples(
@@ -294,29 +291,13 @@ def collect_decontaminated_domain_samples(
     seed: int = 42,
 ) -> tuple[list[dict], int]:
     """Stream a training split from HF Hub and retain ``target_count`` decontaminated conversations."""
-    from datasets import load_dataset
-
     if target_count <= 0:
         return [], 0
-    hf_path, subset, split = DOMAIN_HF_SPECS[domain]
-    logger.info("Streaming %s (%s [%s]) for %d clean samples...", domain, hf_path, split, target_count)
-    ds = (
-        load_dataset(hf_path, subset, split=split, streaming=True)
-        if subset is not None
-        else load_dataset(hf_path, split=split, streaming=True)
-    )
-    ds = ds.shuffle(seed=seed, buffer_size=10_000)
-
+    logger.info("Streaming %s for %d clean samples...", domain, target_count)
     accepted: list[dict] = []
     rejected_leaks = 0
-    for row in ds:
-        conv = normalize_domain_row(domain, row)
-        if conv is None:
-            continue
-        contaminated, _reason = index.is_contaminated(conv)
-        if contaminated:
-            rejected_leaks += 1
-            continue
+    for conv, rej in _iter_clean_domain_conversations(domain, index, seed=seed):
+        rejected_leaks = rej
         temp = assign_sampling_temperature(domain, len(accepted))
         accepted.append(
             {
@@ -335,6 +316,204 @@ def collect_decontaminated_domain_samples(
         rejected_leaks,
     )
     return accepted, rejected_leaks
+
+
+async def _post_chat_completion_async(
+    session: aiohttp.ClientSession,
+    endpoint: str,
+    model: str,
+    messages: list[dict[str, str]],
+    temperature: float,
+    max_tokens: int,
+    timeout_s: float = 300.0,
+) -> dict[str, Any]:
+    """POST one chat-completion request with ``return_token_ids=True`` for exact boundary masks."""
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "return_token_ids": True,
+    }
+    if temperature == 0.0:
+        payload["top_p"] = 1.0
+
+    url = f"{endpoint.rstrip('/')}/chat/completions"
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
+    async with session.post(url, json=payload, timeout=timeout) as resp:
+        if not resp.ok:
+            body = (await resp.text())[:400]
+            raise RuntimeError(f"HTTP {resp.status} from {url}: {body}")
+        return await resp.json()
+
+
+async def regenerate_conversation_turns_on_policy(
+    sem: asyncio.Semaphore,
+    session: aiohttp.ClientSession,
+    endpoint: str,
+    model: str,
+    conv: list[dict[str, str]],
+    domain: str,
+    temperature: float,
+    max_tokens: int,
+) -> list[dict[str, Any]]:
+    """Regenerate assistant turns on-policy and return one boundary row per assistant turn."""
+    context: list[dict[str, str]] = []
+    rows_out: list[dict[str, Any]] = []
+    async with sem:
+        for turn in conv:
+            if turn["role"] != "assistant":
+                context.append(turn)
+                continue
+            try:
+                data = await _post_chat_completion_async(
+                    session,
+                    endpoint,
+                    model,
+                    list(context),
+                    temperature,
+                    max_tokens,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("On-policy generation failed (%s); truncating conversation.", exc)
+                break
+
+            choice = (data.get("choices") or [{}])[0]
+            msg = choice.get("message") or {}
+            content = str(msg.get("content") or "").strip()
+            reasoning = str(msg.get("reasoning_content") or "").strip()
+            if not content and not reasoning:
+                break
+
+            assistant_turn = {"role": "assistant", "content": content or reasoning}
+            turn_conv = [*context, assistant_turn]
+            check_turns = list(turn_conv)
+            if reasoning and content:
+                check_turns.append({"role": "assistant", "content": reasoning})
+
+            row: dict[str, Any] = {
+                "conversations": turn_conv,
+                "domain": domain,
+                "temperature": temperature,
+                "_decontam_turns": check_turns,
+            }
+            prompt_ids = data.get("prompt_token_ids")
+            comp_ids = choice.get("token_ids")
+            if prompt_ids and comp_ids:
+                row["input_ids"] = [*prompt_ids, *comp_ids]
+                row["loss_mask"] = [0] * len(prompt_ids) + [1] * len(comp_ids)
+
+            rows_out.append(row)
+            context.append(assistant_turn)
+    return rows_out
+
+
+async def _collect_and_regenerate_domain_async(
+    domain: str,
+    target_count: int,
+    index: BenchmarkContaminationIndex,
+    endpoint: str,
+    model: str,
+    concurrency: int,
+    max_tokens: int,
+    part_path: Path,
+    resume: bool,
+    seed: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Stream, regenerate on-policy, decontaminate post-gen, and flush until exact ``target_count`` rows."""
+    if target_count <= 0:
+        return [], 0
+
+    accepted: list[dict[str, Any]] = []
+    if resume and part_path.exists():
+        with part_path.open(encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    accepted.append(json.loads(line))
+                if len(accepted) >= target_count:
+                    break
+        if len(accepted) >= target_count:
+            logger.info(
+                "Domain %s: resumed %d/%d completed rows from %s.",
+                domain,
+                len(accepted),
+                target_count,
+                part_path,
+            )
+            return accepted[:target_count], 0
+
+    part_path.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a" if (resume and accepted) else "w"
+    sem = asyncio.Semaphore(concurrency)
+    connector = aiohttp.TCPConnector(limit=max(16, concurrency * 2))
+    stream_iter = _iter_clean_domain_conversations(domain, index, seed=seed)
+
+    # Skip already-resumed count slots to reduce duplicate prompts on resume
+    for _ in range(len(accepted)):
+        if next(stream_iter, None) is None:
+            break
+
+    total_rejected = 0
+    stream_rej = 0
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        with part_path.open(mode, encoding="utf-8", newline="\n") as out_fh:
+            while len(accepted) < target_count:
+                needed = target_count - len(accepted)
+                batch_size = min(max(concurrency * 2, 8), max(needed, 8))
+                candidates: list[tuple[list[dict[str, str]], float]] = []
+                for idx in range(batch_size):
+                    nxt = next(stream_iter, None)
+                    if nxt is None:
+                        break
+                    conv, stream_rej = nxt
+                    temp = assign_sampling_temperature(domain, len(accepted) + idx)
+                    candidates.append((conv, temp))
+                if not candidates:
+                    break
+
+                tasks = [
+                    regenerate_conversation_turns_on_policy(
+                        sem=sem,
+                        session=session,
+                        endpoint=endpoint,
+                        model=model,
+                        conv=conv,
+                        domain=domain,
+                        temperature=temp,
+                        max_tokens=max_tokens,
+                    )
+                    for conv, temp in candidates
+                ]
+                batches = await asyncio.gather(*tasks)
+                for turn_rows in batches:
+                    for row in turn_rows:
+                        check_turns = row.pop("_decontam_turns", row["conversations"])
+                        contaminated, _ = index.is_contaminated(check_turns)
+                        if contaminated:
+                            total_rejected += 1
+                            continue
+                        # Reassign exact stratified temperature slot for accepted index
+                        row["temperature"] = assign_sampling_temperature(
+                            domain, len(accepted)
+                        )
+                        accepted.append(row)
+                        out_fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        if len(accepted) >= target_count:
+                            break
+                    if len(accepted) >= target_count:
+                        break
+                out_fh.flush()
+
+    total_rejected += stream_rej
+    logger.info(
+        "Domain %s: completed %d/%d on-policy rows (%d contaminated candidates rejected).",
+        domain,
+        len(accepted),
+        target_count,
+        total_rejected,
+    )
+    return accepted, total_rejected
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -368,6 +547,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional separate path for the stratified held-out validation split.",
     )
     parser.add_argument("--val-samples", type=int, default=5000)
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Resume from per-domain partial JSONL files if interrupted.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args(argv)
 
@@ -394,34 +579,36 @@ def main(argv: list[str] | None = None) -> None:
     all_records: list[dict] = []
     total_rejected = 0
     for domain, count in domain_targets.items():
-        recs, n_rej = collect_decontaminated_domain_samples(
-            domain=domain, target_count=count, index=index, seed=args.seed
-        )
+        if count <= 0:
+            continue
         if args.vllm_endpoint:
+            part_path = args.output_jsonl.with_name(
+                f"{args.output_jsonl.stem}.{domain}.part.jsonl"
+            )
             logger.info(
-                "Regenerating %d %s conversations on-policy via %s...",
-                len(recs),
+                "Collecting & regenerating %d %s rows on-policy via %s...",
+                count,
                 domain,
                 args.vllm_endpoint,
             )
-            recs = asyncio.run(
-                regenerate_batch_async(
-                    records=recs,
+            recs, n_rej = asyncio.run(
+                _collect_and_regenerate_domain_async(
+                    domain=domain,
+                    target_count=count,
+                    index=index,
                     endpoint=args.vllm_endpoint,
                     model=args.verifier_model,
                     concurrency=args.concurrency,
                     max_tokens=args.max_completion_tokens,
+                    part_path=part_path,
+                    resume=bool(args.resume),
+                    seed=args.seed,
                 )
             )
-            # Re-verify generated assistant turns against 13-gram benchmark overlap
-            post_clean: list[dict] = []
-            for rec in recs:
-                contaminated, _ = index.is_contaminated(rec["conversations"])
-                if contaminated:
-                    total_rejected += 1
-                else:
-                    post_clean.append(rec)
-            recs = post_clean
+        else:
+            recs, n_rej = collect_decontaminated_domain_samples(
+                domain=domain, target_count=count, index=index, seed=args.seed
+            )
 
         all_records.extend(recs)
         total_rejected += n_rej
@@ -436,13 +623,19 @@ def main(argv: list[str] | None = None) -> None:
         with args.val_output_jsonl.open("w", encoding="utf-8", newline="\n") as fh:
             for rec in val_records:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        logger.info("Wrote %d held-out validation conversations to %s", len(val_records), args.val_output_jsonl)
+        logger.info(
+            "Wrote %d held-out validation conversations to %s",
+            len(val_records),
+            args.val_output_jsonl,
+        )
     else:
         train_records = all_records
 
-    with args.output_jsonl.open("w", encoding="utf-8", newline="\n") as fh:
+    tmp_out = args.output_jsonl.with_suffix(args.output_jsonl.suffix + ".tmp")
+    with tmp_out.open("w", encoding="utf-8", newline="\n") as fh:
         for rec in train_records:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    tmp_out.replace(args.output_jsonl)
 
     manifest_path = args.output_jsonl.with_suffix(".manifest.json")
     manifest = {
@@ -451,6 +644,13 @@ def main(argv: list[str] | None = None) -> None:
         "ngram_size": args.ngram_size,
         "excluded_benchmarks": args.exclude_benchmarks,
         "on_policy_regenerated": bool(args.vllm_endpoint),
+        "pretokenized_boundary_rows": bool(
+            train_records and "input_ids" in train_records[0]
+        ),
+        "domain_counts": {
+            d: sum(1 for r in all_records if r.get("domain") == d)
+            for d in domain_targets
+        },
         "total_written_train": len(train_records),
         "total_written_val": (
             len(all_records) - len(train_records) if args.val_output_jsonl else 0
@@ -458,7 +658,9 @@ def main(argv: list[str] | None = None) -> None:
         "contaminated_candidates_rejected": total_rejected,
     }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    logger.info("Completed mix build: %s (manifest: %s)", args.output_jsonl, manifest_path)
+    logger.info(
+        "Completed mix build: %s (manifest: %s)", args.output_jsonl, manifest_path
+    )
 
 
 if __name__ == "__main__":

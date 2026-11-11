@@ -668,3 +668,115 @@ def test_advance_and_draft_step_matches_prefill_and_fullgraph_compiles():
 
     assert torch.equal(inc_tokens, ref_tokens)
     assert torch.allclose(inc_conf, ref_conf, atol=1e-4)
+
+
+def test_lasso_weight_trainer_kwargs_override_and_eval_iso_loss():
+    """Verify --kvn-lasso-weight override in get_trainer_kwargs, zero LASSO in eval, and prune_kvn_modes reset."""
+    from speculators.models.kvn_dspark.core import KvNDSparkDraftModel
+
+    torch.manual_seed(505)
+    tl_cfg = _make_qwen3_8b_like_tl_config(
+        hidden_size=64,
+        num_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        sliding_window=32,
+        vocab_size=128,
+    )
+    cfg = _make_v2_speculator_config(
+        tl_cfg,
+        backbone_type="kvn",
+        n_modes=32,
+        block_size=4,
+        kvn_lasso_weight=3e-4,
+    )
+    model = KvNDSparkDraftModel(cfg)
+    _init_dummy_draft_weights(model)
+
+    train_kw, val_kw = KvNDSparkDraftModel.get_trainer_kwargs(
+        loss_fn='{"ce": 0.1, "tv": 0.9}',
+        loss_implementation="eager",
+        kvn_lasso_weight=0.0,
+    )
+    assert train_kw["kvn_lasso_weight"] == pytest.approx(0.0)
+    assert val_kw["kvn_lasso_weight"] == pytest.approx(0.0)
+
+    train_kw_default, val_kw_default = KvNDSparkDraftModel.get_trainer_kwargs(
+        loss_fn='{"ce": 0.1, "tv": 0.9}',
+        loss_implementation="eager",
+    )
+    assert train_kw_default["kvn_lasso_weight"] is None
+    assert val_kw_default["kvn_lasso_weight"] == pytest.approx(0.0)
+
+    seq_len = 16
+    hs = torch.randn(1, seq_len, 3 * 64)
+    ids = torch.randint(0, 128, (1, seq_len))
+    loss_mask = torch.zeros(1, seq_len, dtype=torch.bool)
+    loss_mask[0, 5] = True
+    v_hs = torch.randn(1, seq_len, 64)
+    doc_ids = torch.zeros(1, seq_len, dtype=torch.long)
+
+    model.train()
+    _, loss_with_lasso, metrics_lasso = model(
+        hs, ids, loss_mask, v_hs, doc_ids, max_anchors=1
+    )
+    _, loss_override_zero, metrics_zero = model(
+        hs, ids, loss_mask, v_hs, doc_ids, max_anchors=1, kvn_lasso_weight=0.0
+    )
+    assert loss_with_lasso.item() > loss_override_zero.item() + 1e-6
+    assert "lasso_loss_sum" in metrics_lasso
+    assert metrics_zero["lasso_loss_sum"].item() == pytest.approx(0.0)
+
+    model.eval()
+    _, loss_eval, _ = model(hs, ids, loss_mask, v_hs, doc_ids, max_anchors=1)
+    assert torch.allclose(loss_eval, loss_override_zero, atol=1e-6)
+
+    model.prune_kvn_modes(16)
+    assert model.config.kvn_n_modes == 16
+    assert model.config.kvn_lasso_weight == pytest.approx(0.0)
+
+
+def test_config_roundtrip_and_slim_checkpoint_key_ownership(tmp_path):
+    """Verify KvNDSparkSpeculatorConfig registry round-trip and verifier weight omission on save."""
+    from safetensors.torch import load_file
+    from speculators import SpeculatorModel, SpeculatorModelConfig
+    from speculators.models.kvn_dspark.core import KvNDSparkDraftModel
+
+    tl_cfg = _make_qwen3_8b_like_tl_config(
+        hidden_size=32,
+        num_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        sliding_window=16,
+        vocab_size=64,
+    )
+    cfg_reduced = _make_v2_speculator_config(
+        tl_cfg, backbone_type="kvn", n_modes=16, block_size=4
+    )
+    cfg_reduced.draft_vocab_size = 32
+
+    for data in (cfg_reduced.to_dict(), cfg_reduced.to_diff_dict()):
+        restored = SpeculatorModelConfig.from_dict(data)
+        assert type(restored) is KvNDSparkSpeculatorConfig
+        assert (
+            SpeculatorModel.registered_model_class_from_config(restored)
+            is KvNDSparkDraftModel
+        )
+
+    model_red = KvNDSparkDraftModel(cfg_reduced)
+    _init_dummy_draft_weights(model_red)
+    t2d = torch.zeros(64, dtype=torch.bool)
+    t2d[:32] = True
+    d2t = torch.zeros(32, dtype=torch.long)
+    model_red.load_vocab_mappings(t2d, d2t)
+    red_dir = tmp_path / "reduced"
+    model_red.save_pretrained(red_dir)
+    red_keys = set(load_file(red_dir / "model.safetensors"))
+
+    omitted = {"embed_tokens.weight", "verifier_lm_head.weight", "verifier_norm.weight"}
+    assert omitted.isdisjoint(red_keys)
+    assert "lm_head.weight" in red_keys
+    assert {"t2d", "d2t"}.issubset(red_keys)
+

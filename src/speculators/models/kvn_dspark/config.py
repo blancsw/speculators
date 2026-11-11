@@ -51,7 +51,7 @@ class KvNDSparkSpeculatorConfig(DSparkSpeculatorConfig):
         ge=0,
         description=(
             "Width d_re of the ModalDataReuploadingRFF spectral bottleneck "
-            "(0 preserves legacy full d_model DataReuploadingLinear for ablation)."
+            "(0 automatically resolves eff_d_re = d_model for full-width ablation)."
         ),
     )
     kvn_learnable_rff: bool = Field(

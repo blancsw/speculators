@@ -241,18 +241,25 @@ class KvNDSparkDraftModel(DSparkDraftModel):
             "per_position_loss_weight": per_position_loss_weight,
             "dpace_alpha": dpace_alpha,
         }
-        return dict(shared), dict(shared)
+        train_kwargs = {**shared, "kvn_lasso_weight": kwargs.get("kvn_lasso_weight")}
+        val_kwargs = {**shared, "kvn_lasso_weight": 0.0}
+        return train_kwargs, val_kwargs
 
-    def total_lasso_penalty(self) -> Tensor:
+    def total_lasso_penalty(self, lasso_weight: float | None = None) -> Tensor:
         """Compute dyadic Group-LASSO + L1 penalty across all KvN-RFF readouts."""
-        if not self.kvn_layers or self.config.kvn_lasso_weight <= 0.0:
+        eff_weight = (
+            self.config.kvn_lasso_weight
+            if lasso_weight is None
+            else float(lasso_weight)
+        )
+        if not self.kvn_layers or eff_weight <= 0.0:
             return torch.tensor(0.0, device=self.fc.weight.device)
         pen = sum(layer.lasso_penalty() for layer in self.kvn_layers)
         if self.rollout is not None:
             pen = pen + self.rollout.lasso_penalty()
         if self.born_confidence_head is not None:
             pen = pen + self.born_confidence_head.lasso_penalty()
-        return self.config.kvn_lasso_weight * pen
+        return eff_weight * pen
 
     @torch.no_grad()
     def prune_kvn_modes(self, target_modes: int) -> None:
@@ -303,6 +310,7 @@ class KvNDSparkDraftModel(DSparkDraftModel):
             if self.born_confidence_head is not None:
                 self.born_confidence_head.prune_born_modes(last_top_idx)
         self.config.kvn_n_modes = target_modes
+        self.config.kvn_lasso_weight = 0.0
 
     def _prepare_causal_kvn_inputs(
         self,
@@ -756,6 +764,7 @@ class KvNDSparkDraftModel(DSparkDraftModel):
         confidence_head_alpha: float = 1.0,
         per_position_loss_weight: str = "fixed-exp-decay",
         dpace_alpha: float = 0.5,
+        kvn_lasso_weight: float | None = None,
         **kwargs,
     ):
         (
@@ -833,6 +842,11 @@ class KvNDSparkDraftModel(DSparkDraftModel):
             dpace_alpha=dpace_alpha,
             sample_from_anchor=self.config.sample_from_anchor,
         )
-        lasso_pen = self.total_lasso_penalty()
-        loss = loss + lasso_pen.to(loss.dtype)
+        if self.training:
+            lasso_pen = self.total_lasso_penalty(lasso_weight=kvn_lasso_weight)
+            loss = loss + lasso_pen.to(loss.dtype)
+        else:
+            lasso_pen = torch.zeros((), device=loss.device, dtype=torch.float32)
+        metrics["lasso_loss_sum"] = lasso_pen.detach().to(torch.float32)
+        metrics["lasso_loss_total"] = torch.ones((), device=loss.device)
         return None, loss, metrics

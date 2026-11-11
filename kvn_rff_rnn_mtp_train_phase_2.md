@@ -6,18 +6,18 @@
 > - **CE QUI EST DÉJÀ 100 % TERMINÉ ET COMMITÉ (`[x]` — NE PAS RÉ-IMPLÉMENTER) :**
 >   1. L'architecture complète **`KvN-DSpark v2`** dans `src/speculators/models/kvn_dspark/{config.py,model_definitions.py,core.py}` et `src/speculators/train/{config/schema.py,optimizers.py}`.
 >   2. Le générateur de corpus multi-domaines **100k décontaminé** (`scripts/build_decontaminated_mix.py`), l'orchestrateur d'ablations H200 (`examples/train/kvn_dspark_phase2_h200_suite.sh`), la recette 2×H200 (`examples/train/kvn_dspark_2xh200_online.sh`), et l'évaluateur ECE / AUROC / Pareto / Loi d'Amdahl (`scripts/evaluate/kvn_phase2_calibration_and_amdahl.py`, `examples/evaluate/kvn_dspark_phase2_e2e_eval.sh`).
->   3. La suite de **31 tests unitaires dédiés** (`tests/unit/models/test_kvn_dspark.py`, `tests/unit/models/test_kvn_dspark_v2.py`, `tests/unit/train/test_kvn_phase2_pipeline.py`) et la validation GPU locale sur `Qwen/Qwen3.5-0.8B` (`kvn_rff_mtp/rtx3070ti_qwen3_validation_results.json`).
+>   3. La suite de **35 tests unitaires dédiés** (`tests/unit/models/test_kvn_dspark.py`, `tests/unit/models/test_kvn_dspark_v2.py`, `tests/unit/train/test_kvn_phase2_pipeline.py`) et la validation GPU locale sur `Qwen/Qwen3.5-0.8B` (`kvn_rff_mtp/rtx3070ti_qwen3_validation_results.json`).
 > - **MISSION DE L'AGENT `CARBON` SUR LE CLUSTER H200 (`[ ]` — À EXÉCUTER DANS L'ORDRE) :**
 >   1. **Étape 0 :** Cloner/mettre à jour `kvn-rff-rnn-mtp`, installer `hs_connectors` + `speculators` et passer le gate `pytest` Linux (30 secondes).
->   2. **Phase B :** Générer et préparer le corpus multi-domaines on-policy décontaminé de **100 000 conversations** (`95 000` train + `5 000` validation held-out, `--train-data-ratio 0.95`, `seq_len = 8192`).
->   3. **Phase C :** Exécuter la matrice d'ablations orthogonales à **9 modèles** (dont **3 seeds `42, 1337, 2026`** sur `B1`, `A4` et `A5` + élagage dyadique zéro-shot `512 -> 128` + micro-recalibration 1 époque).
->   4. **Phase D :** Exécuter la suite d'évaluation de bout en bout sous `vLLM` + `AIPerf` (`examples/evaluate/kvn_dspark_phase2_e2e_eval.sh`), vérifier les métriques Go/No-Go (Section 5), et générer le rapport scientifique final `kvn_rff_rnn_mtp_report_phase2.md` (sans commiter les poids `.safetensors` dans Git).
+>   2. **Phase B :** Générer et préparer le corpus multi-domaines on-policy décontaminé de **100 000 séquences bornées exactes** (`95 000` train + `5 000` validation held-out, `--train-data-ratio 0.95`, `seq_len = 8192`, `VLLM_MAX_MODEL_LEN = 12288`).
+>   3. **Phase C :** Exécuter la matrice d'ablations orthogonales à **9 modèles** (dont **3 seeds `42, 1337, 2026`** sur `B1`, `A4` et `A5` + élagage dyadique zéro-shot `512 -> 128` + micro-recalibration 1 époque à `--kvn-lasso-weight 0.0`).
+>   4. **Phase D :** Exécuter la suite d'évaluation sans perte de bout en bout (`examples/evaluate/kvn_dspark_phase2_e2e_eval.sh` via `kvn_phase2_calibration_and_amdahl.py benchmark-e2e` & `calibrate`), vérifier les métriques Go/No-Go (Section 5), et générer le rapport scientifique final `kvn_rff_rnn_mtp_report_phase2.md` (sans commiter les poids `.safetensors` dans Git).
 
 ---
 
 ## Vue d'Ensemble Scientifique & Système (`KvN-DSpark v2`)
 
-**Objectif :** Valider à l'échelle industrielle (**`Qwen/Qwen3-8B`**, puis transfert **`Qwen/Qwen3-32B`**) le drafter spéculatif parallèle par blocs **Zero-Drafter-KV-Cache** (`2.56 KB/seq` en BF16, soit **`1 024×`** de réduction réelle face au KV-cache GQA `2.62 MB/seq` de `DSpark` SWA-128 sur `Qwen3-8B`, et **`-53 %`** de paramètres actifs à `~395M` contre `841.5M` en v1 et `1 072M` pour `DSpark`).
+**Objectif :** Valider à l'échelle industrielle (**`Qwen/Qwen3-8B`**, puis transfert **`Qwen/Qwen3-32B`**) le drafter spéculatif parallèle par blocs **Zero-Drafter-KV-Cache** (`2.56 KB/seq` en BF16, soit **`1 024×`** de réduction réelle face au KV-cache GQA `2.62 MB/seq` de `DSpark` SWA-128 sur `Qwen3-8B`, **`-61.7 %`** de paramètres entraînables à **`356.7M`** contre `931.5M` pour `DSpark`, et **`-53.9 %`** de paramètres actifs d'inférence incluant `lm_head` figée à **`490.9M`** contre `1 065.7M` pour `DSpark`).
 
 **Briques `KvN-DSpark v2` actives par défaut :**
 1. **Alignement causal strict** (`_prepare_causal_kvn_inputs`, `--kvn-strict-causal-shift`) : $\tilde{h}^{\text{fc}}_t = h^{\text{fc}}_{t-1}$ masqué aux frontières `document_ids` — élimine 100 % de la fuite d'ancre de Phase 1 et supprime tout *rollback* sur le jeton bonus en `vLLM`.
@@ -45,7 +45,7 @@
 
 ### Étape 0 (À exécuter par `Carbon` dès connexion au nœud H200)
 
-- [ ] **Étape 0.1 : Installation de l'environnement Linux H200 et Gate `pytest` (31 tests)**
+- [ ] **Étape 0.1 : Installation de l'environnement Linux H200 et Gate `pytest` (35 tests dédiés)**
   ```bash
   git clone -b kvn-rff-rnn-mtp git@github.com:blancsw/speculators.git
   cd speculators
@@ -61,7 +61,7 @@
   export TOKENIZERS_PARALLELISM=false
   export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
-  # Gate de non-régression obligatoire avant lancement GPU (doit afficher : 31 passed)
+  # Gate de non-régression obligatoire avant lancement GPU (doit afficher : 35 passed)
   pytest tests/unit/models/test_kvn_dspark.py \
          tests/unit/models/test_kvn_dspark_v2.py \
          tests/unit/train/test_kvn_phase2_pipeline.py -v
@@ -98,15 +98,16 @@ Le passage de `68k` à **`100 000` conversations** (`95 000` entraînement + `5 
   ALL_GPUS="${ALL_GPUS:-0,1}"
   DP_GEN="${DP_GEN:-2}"
 
-  # 1. Serveur vLLM dédié à la régénération rapide des 100k conversations + rendu prepare-data
+  # 1. Serveur vLLM dédié à la régénération rapide des 100k séquences (max-model-len 12288 > seq-length 8192)
   CUDA_VISIBLE_DEVICES="$ALL_GPUS" python scripts/launch_vllm.py "$VERIFIER_MODEL" \
       --target-layer-ids 2 18 33 \
       --hidden-states-path "/dev/shm/kvn_prep_hs" \
-      -- --data-parallel-size "$DP_GEN" --port 8000 --max-model-len 8192 --gpu-memory-utilization 0.90 &
+      -- --data-parallel-size "$DP_GEN" --port 8000 --max-model-len 12288 --gpu-memory-utilization 0.90 &
   VLLM_PREP_PID=$!
   until curl -sf http://localhost:8000/health > /dev/null; do sleep 2; done
 
-  # 2. Construction du mix 100k (45k UltraChat + 32k OpenMath + 23k Magicoder) + décontamination 13-grammes/SHA-256
+  # 2. Construction du mix 100k exact (45k UltraChat + 32k OpenMath + 23k Magicoder) avec return_token_ids=True,
+  #    décontamination 13-grammes/SHA-256 post-génération et reprise automatique sur panne (--resume)
   python scripts/build_decontaminated_mix.py \
       --verifier-model "$VERIFIER_MODEL" \
       --ultrachat-samples 45000 \
@@ -117,9 +118,10 @@ Le passage de `68k` à **`100 000` conversations** (`95 000` entraînement + `5 
       --concurrency $((64 * DP_GEN)) \
       --output-jsonl "$RAW_JSONL" \
       --val-samples 0 \
+      --resume \
       --seed 42
 
-  # 3. Tokenisation exacte via l'endpoint render vLLM, masques assistant et token_freq.pt
+  # 3. Conversion directe des (input_ids, loss_mask) pré-tokenisés en Arrow + calcul de token_freq.pt
   speculators prepare-data \
       --model "$VERIFIER_MODEL" \
       --data "$RAW_JSONL" \
@@ -145,17 +147,17 @@ Sur le corpus de **`100 000` conversations** (`95k` train / `5k` val, `--train-d
 
 ### Tableau de la Matrice Expérimentale Orthogonale (9 Modèles)
 
-| ID Run | Seeds | Backbone | Causal Shift & Scan Reset | RFF ($d_{\text{re}}$, $\Omega$) & `anchor_rank` | Rollout Multi-Couches | Mixer Intra-Bloc $K\times K$ | Confiance (Born / Vide / Interf.) | Modes $M_{\text{train}} \to M_{\text{infer}}$ | Params Actifs | État / Séq | Question Scientifique Isolée |
+| ID Run | Seeds | Backbone | Causal Shift & Scan Reset | RFF ($d_{\text{re}}$, $\Omega$) & `anchor_rank` | Rollout Multi-Couches | Mixer Intra-Bloc $K\times K$ | Confiance (Born / Vide / Interf.) | Modes $M_{\text{train}} \to M_{\text{infer}}$ | Params Entraîn. *(Actifs w/ `lm_head`)* | État / Séq | Question Scientifique Isolée |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
-| **`B1_DSpark_SWA128`** | `42,1337,2026` | `swa` ($W=128$) | Natif SWA | — | Natif Attn | Natif 5× | MLP `DSpark` | — | `1 072 M` | **`2.62 MB`** | Baseline SOTA officielle `DSpark` |
-| **`B2_DSpark_SWA512`** | `42` | `swa` ($W=512$) | Natif SWA | — | Natif Attn | Natif 5× | MLP `DSpark` | — | `1 072 M` | **`10.49 MB`** | Coût mémoire SWA sur contexte 8k |
-| **`B3_Hybrid_1SWA_4KvN`** | `42` | `hybrid` | **Oui (v2)** | $512$, Appren., $r_a=512$ | Oui | Oui | **Interf. + Vide** | $128 \to 128$ | `462 M` | **`526 KB`** | Compromis hybride (`5×` moins de KV) |
-| **`A0_KvN_v1_CausalFix`** | `42` | `kvn` | **Oui (v2)** | Dense ($4096$, figé), Dense | Non (couche 4) | Non | Born v1 (sans interf.) | $128 \to 128$ | `841 M` | **`2.56 KB`** | **Vraie base Phase 1 sans fuite causale** |
-| **`A1_KvN_ModalRFF_Comp`** | `42` | `kvn` | **Oui (v2)** | **$512$, Appren., $r_a=512$** | Non (couche 4) | Non | Born v1 | $128 \to 128$ | **`361 M`** | **`2.56 KB`** | Gain spectral Barthe + `-57%` params |
-| **`A2_KvN_Multilayer`** | `42` | `kvn` | **Oui (v2)** | $512$, Appren., $r_a=512$ | **Oui (5 couches)** | Non | Born v1 | $128 \to 128$ | `362 M` | **`2.56 KB`** | Gain des échelles fréquentielles basses |
-| **`A3_KvN_IntraBlock`** | `42` | `kvn` | **Oui (v2)** | $512$, Appren., $r_a=512$ | Oui | **Oui ($8\times 8$)** | MLP `DSpark` *(no Born)* | $128 \to 128$ | `395 M` | **`2.56 KB`** | **Briser le plafond *H-Spec* sur $k=2..7$** |
-| **`A4_KvN_v2_Full128`** | `42,1337,2026` | `kvn` | **Oui (v2)** | $512$, Appren., $r_a=512$ | Oui | Oui | **Interf. + Vide (v2)** | $128 \to 128$ | **`395 M`** | **`2.56 KB`** | **Gain pur de la calibration Born v2** *(vs `A3`)* |
-| **`A5_KvN_v2_LASSO_512to128`** | `42,1337,2026` | `kvn` | **Oui (v2)** | $512$, Appren., $r_a=512$ | Oui | Oui | **Interf. + Vide (v2)** | **$512 \to 128$** | **`395 M`** *(post-prune)* | **`2.56 KB`** | **Gain de loterie spectrale Group-LASSO dyadique** |
+| **`B1_DSpark_SWA128`** | `42,1337,2026` | `swa` ($W=128$) | Natif SWA | — | Natif Attn | Natif 5× | MLP `DSpark` | — | `931.5M` *(`1 065.7M`)* | **`2.62 MB`** | Baseline SOTA officielle `DSpark` |
+| **`B2_DSpark_SWA512`** | `42` | `swa` ($W=512$) | Natif SWA | — | Natif Attn | Natif 5× | MLP `DSpark` | — | `931.5M` *(`1 065.7M`)* | **`10.49 MB`** | Coût mémoire SWA sur contexte 8k |
+| **`B3_Hybrid_1SWA_4KvN`** | `42` | `hybrid` | **Oui (v2)** | $512$, Appren., $r_a=512$ | Oui | Oui | **Interf. + Vide** | $128 \to 128$ | `494.2M` *(`628.4M`)* | **`526 KB`** | Compromis hybride (`5×` moins de KV) |
+| **`A0_KvN_v1_CausalFix`** | `42` | `kvn` | **Oui (v2)** | Dense (`d_re=0`), Figé, `r_a=0` | Non (couche 4) | Non | Born v1 (sans interf.) | $128 \to 128$ | `616.7M` *(`750.9M`)* | **`2.56 KB`** | **Vraie base Phase 1 sans fuite causale** |
+| **`A1_KvN_ModalRFF_Comp`** | `42` | `kvn` | **Oui (v2)** | **$512$, Appren., $r_a=512$** | Non (couche 4) | Non | Born v1 | $128 \to 128$ | **`264.4M`** *(`398.6M`)* | **`2.56 KB`** | Gain spectral Barthe + `-57%` params vs `A0` |
+| **`A2_KvN_Multilayer`** | `42` | `kvn` | **Oui (v2)** | $512$, Appren., $r_a=512$ | **Oui (5 couches)** | Non | Born v1 | $128 \to 128$ | `264.4M` *(`398.6M`)* | **`2.56 KB`** | Gain des échelles fréquentielles basses |
+| **`A3_KvN_IntraBlock`** | `42` | `kvn` | **Oui (v2)** | $512$, Appren., $r_a=512$ | Oui | **Oui ($8\times 8$)** | MLP `DSpark` *(no Born)* | $128 \to 128$ | `356.6M` *(`490.8M`)* | **`2.56 KB`** | **Briser le plafond *H-Spec* sur $k=2..7$** |
+| **`A4_KvN_v2_Full128`** | `42,1337,2026` | `kvn` | **Oui (v2)** | $512$, Appren., $r_a=512$ | Oui | Oui | **Interf. + Vide (v2)** | $128 \to 128$ | **`356.7M`** *(`490.9M`)* | **`2.56 KB`** | **Gain pur de la calibration Born v2** *(vs `A3`)* |
+| **`A5_KvN_v2_LASSO_512to128`** | `42,1337,2026` | `kvn` | **Oui (v2)** | $512$, Appren., $r_a=512$ | Oui | Oui | **Interf. + Vide (v2)** | **$512 \to 128$** | **`356.7M`** *(`490.9M` post-prune)* | **`2.56 KB`** | **Gain de loterie spectrale Group-LASSO dyadique** |
 
 ### Exécution de la Phase C par `Carbon`
 
@@ -185,7 +187,7 @@ Sur le corpus de **`100 000` conversations** (`95k` train / `5k` val, `--train-d
 
 - [ ] **Étape C.3 (Extension Papier si budget GPU disponible) : Transfert d'échelle `Qwen/Qwen3-32B`**
   ```bash
-  MODEL="Qwen/Qwen3-32B" TARGET_LAYER_IDS="4 32 60" \
+  MODEL="Qwen/Qwen3-32B" TARGET_LAYER_IDS="2 32 61" \
   OUTPUT_DIR="/workspace/kvn_phase2_artifacts/qwen3_32b_kvn_v2" \
   MAX_SAMPLES=50000 EPOCHS=5 \
   bash examples/train/kvn_dspark_2xh200_online.sh
@@ -193,15 +195,15 @@ Sur le corpus de **`100 000` conversations** (`95k` train / `5k` val, `--train-d
 
 ---
 
-## 4. Phase D — Évaluation de Bout en Bout (`vLLM` + `AIPerf` + Calibration + Loi d'Amdahl) & Livrables
+## 4. Phase D — Évaluation Sans Perte de Bout en Bout (Acceptation, Calibration & Loi d'Amdahl)
 
-> **Note `LAST_EPOCH` :** Avec `EPOCHS=6` (époques indexées `0..5`), le dernier checkpoint d'entraînement est le dossier **`5`** (`LAST_EPOCH=5`, valeur par défaut de `examples/evaluate/kvn_dspark_phase2_e2e_eval.sh`). Pour le checkpoint recalibré 1 époque (`A5_KvN_v2_Pruned128_Recal_s42`), le dossier est toujours `0`.
+> **Note `LAST_EPOCH` & Compatibilité Online :** Avec `EPOCHS=6` (époques indexées `0..5`), le dernier checkpoint d'entraînement est le dossier **`5`** (`LAST_EPOCH=5`, valeur par défaut de `examples/evaluate/kvn_dspark_phase2_e2e_eval.sh`). Pour les checkpoints recalibrés 1 époque (`A5_KvN_v2_Pruned128_Recal_s{42,1337,2026}`), le dossier est `0`. Le harnais `scripts/evaluate/kvn_phase2_calibration_and_amdahl.py` évalue nativement sous le **même vérifieur PyTorch `Qwen/Qwen3-8B` et le même rejet spéculatif exact** toutes les architectures (`kvn`, `hybrid_1swa_2kvn` et `swa`) et extrait automatiquement les états cachés de validation depuis `ArrowDataset(split="val")` même lorsqu'aucun dossier `hidden_states/` n'existe sur disque après entraînement online.
 
 - [ ] **Étape D.1 : Exécuter la campagne complète `examples/evaluate/kvn_dspark_phase2_e2e_eval.sh`**
-  Ce script exécute séquentiellement :
-  1. **Qualité d'acceptation spéculative ($\tau$)** via `scripts/evaluate/evaluate.py acceptance` sur **5 benchmarks hors-distribution** (`spec_al_mtbench`, `spec_al_gsm8k`, `spec_al_math500`, `spec_al_humaneval`, `spec_al_mbpp`) en régimes **Greedy ($T=0.0$)** et **Stochastique ($T=0.6$)**.
-  2. **Calibration physique de confiance** via `scripts/evaluate/kvn_phase2_calibration_and_amdahl.py calibrate` comparant `A0` (Born v1 aveugle à la phase), `A3` (MLP `DSpark`), `A4` et `A5` (**Born v2 avec interféromètre dyadique + mode du vide $|M+1\rangle$**) sur l'**ECE à 15 bacs**, l'**AUROC de rejet**, et la **courbe de Pareto d'arrêt dynamique** ($\gamma_{\text{conf}} \in \{0.0, 0.2, 0.35, 0.5, 0.65, 0.8\}$).
-  3. **Speedup réel de bout en bout (Loi d'Amdahl)** via `scripts/evaluate/evaluate.py speedup` balayant la concurrence **$B \in \{1, 4, 8, 16, 32, 64, 128, 256\}$** face au vérifieur `Qwen/Qwen3-8B` sans spéculation et face à `B1_DSpark_SWA128`.
+  Ce script exécute séquentiellement sur l'ensemble des ablations et des 3 seeds (`42, 1337, 2026`) :
+  1. **Qualité d'acceptation spéculative sans perte ($\tau$)** via `kvn_phase2_calibration_and_amdahl.py benchmark-e2e` sur **5 benchmarks hors-distribution** (`mt_bench`, `gsm8k`, `math500`, `humaneval`, `mbpp`) en régimes **Greedy ($T=0.0$, parité bit-à-bit vérifiée)** et **Stochastique ($T=0.6$, rejection sampling exact de Leviathan/Chen)**.
+  2. **Calibration physique de confiance** via `kvn_phase2_calibration_and_amdahl.py calibrate` comparant `A0` (Born v1 aveugle à la phase), `A3` (MLP `DSpark`), `A4` et `A5` (**Born v2 avec interféromètre dyadique + mode du vide $|M+1\rangle$**) sur l'**ECE à 15 bacs**, l'**AUROC de rejet**, et la **courbe de Pareto d'arrêt dynamique** ($\gamma_{\text{conf}} \in \{0.0, 0.2, 0.35, 0.5, 0.65, 0.8\}$).
+  3. **Speedup réel de bout en bout (Loi d'Amdahl)** via `kvn_phase2_calibration_and_amdahl.py benchmark-e2e --batch-sizes 1 4 8 16 32 64 128` comparant `B1_DSpark_SWA128`, `B2_DSpark_SWA512`, `A4_KvN_v2_Full128` et `A5_KvN_v2_Pruned128_Recal` face au vérifieur autorégressif `Qwen/Qwen3-8B`.
   ```bash
   CUDA_VISIBLE_DEVICES=0 \
   ARTIFACT_ROOT="/workspace/kvn_phase2_artifacts" \
@@ -220,7 +222,7 @@ Sur le corpus de **`100 000` conversations** (`95k` train / `5k` val, `--train-d
 | :--- | :---: | :---: | :---: |
 | **Fuite causale à l'ancre / inter-documents** | Présente (`+28.6 pts` pos 0) | **`0.00` (`atol < 1e-6`)** *(Acquis)* | **`0.00` prouvé par test unitaire formel** *(Acquis)* |
 | **Empreinte d'état drafter / séquence (`Qwen3-8B`)** | `2.56 KB` | **`2.56 KB` (`1 024×` vs SWA-128)** *(Acquis)* | **`2.56 KB` (`0 B` KV-cache, `4 096×` vs SWA-512)** *(Acquis)* |
-| **Paramètres actifs du drafter** | `841.5 M` | `< 450 M` *(Acquis)* | **`~395 M` (`-53 %` vs v1, `-63 %` vs `DSpark`)** *(Acquis)* |
+| **Paramètres entraînables / actifs (`Qwen3-8B`)** | `841.5 M` | `< 500 M` *(Acquis)* | **`356.7 M` entraîn. / `490.9 M` actifs (`-61.7 %` entraîn. / `-53.9 %` actifs vs `DSpark`)** *(Acquis)* |
 | **Corpus d'entraînement on-policy décontaminé** | `1k` (`tutorial_regen`, fuité) | `68k` multi-domaines | **`100 000` (`95k` train + `5k` val, 0 fuite 13-grammes)** |
 | **Longueur moyenne d'acceptation $\tau$ ($K=8$, Greedy, moy. 5 benchs)** | Biaisée (`tutorial_regen`) | $\ge 97\%$ du $\tau$ de `B1_DSpark_SWA128` | **$\ge 100\%$ du $\tau$ de `B1_DSpark_SWA128` ($\tau \ge 3.6$–$4.2$)** |
 | **Calibration de confiance (ECE 15 bacs sur rejet)** | Non mesurée (MAE seule) | `< 0.045` | **`< 0.025` (`A4` Born-Vide bat `A3` MLP significativement)** |
