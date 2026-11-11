@@ -1,0 +1,91 @@
+{
+  "hardware": "NVIDIA GeForce RTX 3070 Ti Laptop GPU",
+  "verifier_model": "Qwen/Qwen3.5-0.8B",
+  "target_layer_ids": [
+    2,
+    12,
+    21
+  ],
+  "seq_len": 256,
+  "draft_vocab_size": 4096,
+  "epochs": 5,
+  "models": [
+    {
+      "id": "M1_DSpark_SWA_Baseline",
+      "verifier_model": "Qwen/Qwen3.5-0.8B",
+      "backbone_type": "swa",
+      "train_modes": 128,
+      "infer_modes": 128,
+      "active_drafter_params": 84963073,
+      "state_cache_bytes_per_seq": 786432,
+      "train_wall_time_s": 25.13,
+      "val_loss": 0.6896,
+      "accept_rate_pct": 12.81,
+      "accept_len_tau": 1.5613,
+      "greedy_eal": 2.1406,
+      "full_acc_pct": 29.88,
+      "pos0_acc_pct": 79.69,
+      "confidence_mae": 0.0938
+    },
+    {
+      "id": "M2_DSpark_Hybrid_1SWA_2KvN",
+      "verifier_model": "Qwen/Qwen3.5-0.8B",
+      "backbone_type": "hybrid_1swa_2kvn",
+      "train_modes": 128,
+      "infer_modes": 128,
+      "active_drafter_params": 69402945,
+      "state_cache_bytes_per_seq": 263168,
+      "train_wall_time_s": 30.96,
+      "val_loss": 0.7029,
+      "accept_rate_pct": 9.87,
+      "accept_len_tau": 1.4586,
+      "greedy_eal": 2.3281,
+      "full_acc_pct": 27.64,
+      "pos0_acc_pct": 71.09,
+      "confidence_mae": 0.079
+    },
+    {
+      "id": "M3_KvN_DSpark_ZeroKV_Base",
+      "verifier_model": "Qwen/Qwen3.5-0.8B",
+      "backbone_type": "kvn",
+      "train_modes": 128,
+      "infer_modes": 128,
+      "active_drafter_params": 57317889,
+      "state_cache_bytes_per_seq": 1536,
+      "train_wall_time_s": 36.33,
+      "val_loss": 0.7363,
+      "accept_rate_pct": 6.72,
+      "accept_len_tau": 1.2437,
+      "greedy_eal": 2.0391,
+      "full_acc_pct": 25.59,
+      "pos0_acc_pct": 44.53,
+      "confidence_mae": 0.0604
+    },
+    {
+      "id": "M4_KvN_DSpark_ZeroKV_Scaled_LASSO",
+      "verifier_model": "Qwen/Qwen3.5-0.8B",
+      "backbone_type": "kvn",
+      "train_modes": 512,
+      "infer_modes": 128,
+      "active_drafter_params": 57317889,
+      "state_cache_bytes_per_seq": 1536,
+      "train_wall_time_s": 34.31,
+      "val_loss": 0.7375,
+      "accept_rate_pct": 6.71,
+      "accept_len_tau": 1.2408,
+      "greedy_eal": 2.1172,
+      "full_acc_pct": 26.27,
+      "pos0_acc_pct": 49.22,
+      "confidence_mae": 0.0572,
+      "post_prune_1ep_recal_metrics": {
+        "val_loss": 0.7417,
+        "accept_rate_pct": 6.66,
+        "accept_len_tau": 1.3069,
+        "greedy_eal": 2.1328,
+        "full_acc_pct": 24.41,
+        "pos0_acc_pct": 51.56,
+        "confidence_mae": 0.0701
+      }
+    }
+  ]
+}

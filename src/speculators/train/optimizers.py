@@ -38,6 +38,10 @@ _ADAMW_NAME_HINTS = (
     "readout_linear",
     "obs_linear",
     "born_proj",
+    "omega_rff",
+    "dyad_",
+    "layer_mode_",
+    "vacuum_",
 )
 
 # Muon only orthogonalizes 2D weight matrices.

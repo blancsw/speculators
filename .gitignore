@@ -198,3 +198,6 @@ hs_connectors/pip-delete-this-directory.txt
 
 # MRCR rendered-data cache (evaluate.py --dataset openai/mrcr)
 mrcr_data/
+
+# Local KvN-DSpark GPU validation checkpoints & extracted hidden states
+kvn_rff_mtp/rtx3070ti_validation_run/

@@ -220,6 +220,14 @@ def run_rtx3070ti_validation() -> dict:
             "--kvn-backbone-type", spec["kvn_backbone_type"],
             "--kvn-n-modes", str(spec["kvn_n_modes"]),
             "--kvn-reupload-layers", "2",
+            "--kvn-reupload-dim", "256",
+            "--kvn-learnable-rff",
+            "--kvn-anchor-rank", "256",
+            "--kvn-enable-interferometer",
+            "--kvn-vacuum-born-norm",
+            "--kvn-multilayer-rollout",
+            "--kvn-intrablock-mixer",
+            "--kvn-strict-causal-shift",
             "--kvn-lasso-weight", "2e-4" if spec["prune_to"] else "1e-5",
             "--on-missing", "raise",
             "--seed", "42",
@@ -240,15 +248,62 @@ def run_rtx3070ti_validation() -> dict:
         val_metrics = json.loads(val_metrics_file.read_text()) if val_metrics_file.exists() else {}
 
         # Reload saved checkpoint via KvNDSparkDraftModel.from_pretrained to verify HF/speculators compatibility
+        t2d_tensor = torch.from_numpy(__import__("numpy").load(data_dir / f"t2d-{draft_vocab_size}.npy"))
+        d2t_tensor = torch.from_numpy(__import__("numpy").load(data_dir / f"d2t-{draft_vocab_size}.npy"))
         loaded_model = KvNDSparkDraftModel.from_pretrained(
             last_epoch_dir,
-            t2d=torch.from_numpy(__import__("numpy").load(data_dir / f"t2d-{draft_vocab_size}.npy")),
-            d2t=torch.from_numpy(__import__("numpy").load(data_dir / f"d2t-{draft_vocab_size}.npy")),
+            t2d=t2d_tensor,
+            d2t=d2t_tensor,
         )
+        post_prune_recal_metrics: dict[str, float] | None = None
         if spec["prune_to"] is not None:
             loaded_model.prune_kvn_modes(spec["prune_to"])
             pruned_dir = save_path / f"pruned_m{spec['prune_to']}"
             loaded_model.save_pretrained(pruned_dir)
+
+            # Run 1-epoch post-pruning micro-recalibration (without decoder-shaping flags)
+            recal_save_path = save_path / f"pruned_recal_m{spec['prune_to']}"
+            if recal_save_path.exists():
+                shutil.rmtree(recal_save_path)
+            recal_argv = [
+                "--verifier-name-or-path", verifier_id,
+                "--speculator-type", "kvn_dspark",
+                "--from-pretrained", str(pruned_dir),
+                "--data-path", str(data_dir),
+                "--save-path", str(recal_save_path),
+                "--draft-vocab-size", str(draft_vocab_size),
+                "--total-seq-len", str(seq_len),
+                "--train-data-ratio", "0.8",
+                "--num-workers", "0",
+                "--epochs", "1",
+                "--lr", "1e-4",
+                "--muon-lr", "5e-4",
+                "--optimizer", "muon",
+                "--optimizer-implementation", "eager",
+                "--loss-implementation", "eager",
+                "--loss-fn", '{"ce": 0.1, "tv": 0.9}',
+                "--block-size", "8",
+                "--max-anchors", "32",
+                "--draft-attn-impl", "eager",
+                "--target-layer-ids", *(str(x) for x in target_layer_ids),
+                "--kvn-lasso-weight", "0.0",
+                "--on-missing", "raise",
+                "--seed", "42",
+            ]
+            recal_cfg = TrainConfig.resolve(recal_argv)
+            speculators_train_main(recal_cfg)
+            recal_val_file = recal_save_path / "0" / "val_metrics.json"
+            if recal_val_file.exists():
+                rm = json.loads(recal_val_file.read_text())
+                post_prune_recal_metrics = {
+                    "val_loss": round(float(rm.get("loss_epoch", 0.0)), 4),
+                    "accept_rate_pct": round(100.0 * float(rm.get("accept_rate_epoch", 0.0)), 2),
+                    "accept_len_tau": round(float(rm.get("accept_len_epoch", 0.0)), 4),
+                    "greedy_eal": round(float(rm.get("eal_epoch", 0.0)), 4),
+                    "full_acc_pct": round(100.0 * float(rm.get("full_acc_epoch", 0.0)), 2),
+                    "pos0_acc_pct": round(100.0 * float(rm.get("position_0_acc_epoch", 0.0)), 2),
+                    "confidence_mae": round(float(rm.get("confidence_abs_error_epoch", 0.0)), 4),
+                }
 
         state_bytes = loaded_model.config.estimated_state_bytes_per_seq()
         active_params = sum(p.numel() for p in loaded_model.parameters() if p.requires_grad)
@@ -267,9 +322,12 @@ def run_rtx3070ti_validation() -> dict:
             "accept_len_tau": round(float(val_metrics.get("accept_len_epoch", 0.0)), 4),
             "greedy_eal": round(float(val_metrics.get("eal_epoch", 0.0)), 4),
             "full_acc_pct": round(100.0 * float(val_metrics.get("full_acc_epoch", 0.0)), 2),
-            "pos0_acc_pct": round(100.0 * float(val_metrics.get("position_0_acc_epoch", 0.0)), 2),
+            "pos0_acc_pct": round(100.0 * float(rm.get("position_0_acc_epoch", 0.0) if post_prune_recal_metrics and "rm" in locals() else val_metrics.get("position_0_acc_epoch", 0.0)), 2),
             "confidence_mae": round(float(val_metrics.get("confidence_abs_error_epoch", 0.0)), 4),
         }
+        entry["pos0_acc_pct"] = round(100.0 * float(val_metrics.get("position_0_acc_epoch", 0.0)), 2)
+        if post_prune_recal_metrics is not None:
+            entry["post_prune_1ep_recal_metrics"] = post_prune_recal_metrics
         results.append(entry)
         print(
             f"[{model_id:<34}] Cache/Seq: {state_bytes:>9,d} B | "

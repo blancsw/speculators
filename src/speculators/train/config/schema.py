@@ -593,7 +593,50 @@ class KvNDSparkArgs(_Group):
     )
     kvn_use_born_confidence: bool = Field(
         default=True,
-        description="KvN-DSpark: feed amplified Born-rule energy 2M*(q^2+p^2)-1 into confidence head.",
+        description="KvN-DSpark: feed interferometric Born-rule energy into confidence head.",
+    )
+    kvn_reupload_dim: int = Field(
+        default=512,
+        ge=0,
+        description="KvN-DSpark: width d_re of ModalDataReuploadingRFF bottleneck (0 = full d_model).",
+    )
+    kvn_learnable_rff: bool = Field(
+        default=True,
+        description="KvN-DSpark: train RFF spectral frequencies omega_rff under AdamW.",
+    )
+    kvn_enable_interferometer: bool = Field(
+        default=True,
+        description="KvN-DSpark: apply O(M) dyadic symplectic beamsplitters before Born detection.",
+    )
+    kvn_vacuum_born_norm: bool = Field(
+        default=True,
+        description="KvN-DSpark: normalize Born energies with Barthe Eq. 4.34 vacuum mode |M+1>.",
+    )
+    kvn_anchor_rank: int = Field(
+        default=512,
+        ge=0,
+        description="KvN-DSpark: low-rank bottleneck r_a for anchor_proj (0 = dense).",
+    )
+    kvn_multilayer_rollout: bool = Field(
+        default=True,
+        description="KvN-DSpark: aggregate modal states across all draft layers in rollout.",
+    )
+    kvn_intrablock_mixer: bool = Field(
+        default=True,
+        description="KvN-DSpark: attach Zero-KV KxK IntraBlockCausalMixer over speculative horizons.",
+    )
+    kvn_strict_causal_shift: bool = Field(
+        default=True,
+        description="KvN-DSpark: shift fc_output by 1 step with document_ids boundary masking.",
+    )
+    kvn_ffn_mult: float = Field(
+        default=1.5,
+        gt=0.0,
+        description="KvN-DSpark: FFN hidden dimension multiplier relative to hidden_size.",
+    )
+    kvn_state_dtype: Literal["bfloat16", "float32"] = Field(
+        default="bfloat16",
+        description="KvN-DSpark: precision of persistent recurrent state buffer at inference.",
     )
 
 

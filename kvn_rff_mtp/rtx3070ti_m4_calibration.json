@@ -1,0 +1,87 @@
+{
+  "checkpoint": "kvn_rff_mtp\\rtx3070ti_validation_run\\checkpoints\\M4_KvN_DSpark_ZeroKV_Scaled_LASSO\\pruned_recal_m128\\0",
+  "state_bytes_per_seq": 1536,
+  "num_evaluated_blocks": 579,
+  "overall_ece_15bin": 0.0424,
+  "overall_rejection_auroc": 0.6369,
+  "per_position": {
+    "pos_0": {
+      "accept_rate_pct": 18.13,
+      "ece": 0.078,
+      "rejection_auroc": 0.6439
+    },
+    "pos_1": {
+      "accept_rate_pct": 20.21,
+      "ece": 0.1366,
+      "rejection_auroc": 0.6152
+    },
+    "pos_2": {
+      "accept_rate_pct": 11.4,
+      "ece": 0.0697,
+      "rejection_auroc": 0.5752
+    },
+    "pos_3": {
+      "accept_rate_pct": 15.54,
+      "ece": 0.093,
+      "rejection_auroc": 0.6786
+    },
+    "pos_4": {
+      "accept_rate_pct": 9.33,
+      "ece": 0.041,
+      "rejection_auroc": 0.4897
+    },
+    "pos_5": {
+      "accept_rate_pct": 9.15,
+      "ece": 0.0241,
+      "rejection_auroc": 0.6151
+    },
+    "pos_6": {
+      "accept_rate_pct": 6.39,
+      "ece": 0.0129,
+      "rejection_auroc": 0.5961
+    },
+    "pos_7": {
+      "accept_rate_pct": 3.28,
+      "ece": 0.0376,
+      "rejection_auroc": 0.6021
+    }
+  },
+  "dynamic_stopping_pareto": [
+    {
+      "gamma_conf": 0.0,
+      "mean_drafted_tokens": 8.0,
+      "mean_accept_length_tau": 1.2297,
+      "verifier_slot_flops_saved_pct": 0.0
+    },
+    {
+      "gamma_conf": 0.2,
+      "mean_drafted_tokens": 0.2815,
+      "mean_accept_length_tau": 1.0259,
+      "verifier_slot_flops_saved_pct": 96.48
+    },
+    {
+      "gamma_conf": 0.35,
+      "mean_drafted_tokens": 0.0,
+      "mean_accept_length_tau": 1.0,
+      "verifier_slot_flops_saved_pct": 100.0
+    },
+    {
+      "gamma_conf": 0.5,
+      "mean_drafted_tokens": 0.0,
+      "mean_accept_length_tau": 1.0,
+      "verifier_slot_flops_saved_pct": 100.0
+    },
+    {
+      "gamma_conf": 0.65,
+      "mean_drafted_tokens": 0.0,
+      "mean_accept_length_tau": 1.0,
+      "verifier_slot_flops_saved_pct": 100.0
+    },
+    {
+      "gamma_conf": 0.8,
+      "mean_drafted_tokens": 0.0,
+      "mean_accept_length_tau": 1.0,
+      "verifier_slot_flops_saved_pct": 100.0
+    }
+  ]
+}
