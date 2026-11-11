@@ -19,10 +19,15 @@
 VERIFIER_MODEL="${VERIFIER_MODEL:-Qwen/Qwen3-8B}"
 TARGET_LAYER_IDS="${TARGET_LAYER_IDS:-2 18 33}"
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-/workspace/kvn_phase2_artifacts}"
-DATA_DIR="${DATA_DIR:-${ARTIFACT_ROOT}/data/qwen3_8b_mix68k_seq8192}"
+DATA_DIR="${DATA_DIR:-${ARTIFACT_ROOT}/data/qwen3_8b_mix100k_seq8192}"
 SAVE_ROOT="${SAVE_ROOT:-${ARTIFACT_ROOT}/checkpoints}"
 HS_CACHE_DIR="${HS_CACHE_DIR:-/dev/shm/kvn_phase2_hs_cache}"
 VLLM_PORT="${VLLM_PORT:-8000}"
+
+# Stratified 100k Multi-Domain On-Policy Mix (95k train + 5k held-out val via TRAIN_DATA_RATIO=0.95)
+ULTRACHAT_SAMPLES="${ULTRACHAT_SAMPLES:-45000}"
+OPENMATH_SAMPLES="${OPENMATH_SAMPLES:-32000}"
+MAGICODER_SAMPLES="${MAGICODER_SAMPLES:-23000}"
 
 # Hardware Topology:
 # - Default 2xH200: VLLM_GPUS="0", TRAIN_GPUS="1", NPROC=1, VLLM_DP=1
@@ -34,8 +39,8 @@ NPROC="${NPROC:-1}"
 
 DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32768}"
 SEQ_LENGTH="${SEQ_LENGTH:-8192}"
-EPOCHS="${EPOCHS:-8}"
-TRAIN_DATA_RATIO="${TRAIN_DATA_RATIO:-0.956}"
+EPOCHS="${EPOCHS:-6}"
+TRAIN_DATA_RATIO="${TRAIN_DATA_RATIO:-0.95}"
 SKIP_DATA_PREP="${SKIP_DATA_PREP:-0}"
 
 # Build exact speculators.train CLI argv for any of the 9 orthogonal ablation models
@@ -296,14 +301,14 @@ done
 echo "vLLM server ready on port ${VLLM_PORT}."
 
 if [[ "$SKIP_DATA_PREP" != "1" ]]; then
-    RAW_JSONL="${ARTIFACT_ROOT}/raw_onpolicy_68k.jsonl"
+    RAW_JSONL="${ARTIFACT_ROOT}/raw_onpolicy_100k.jsonl"
     if [[ ! -f "$RAW_JSONL" ]]; then
-        echo "=== Phase B.2a: Building 13-gram decontaminated 68k multi-domain on-policy JSONL ==="
+        echo "=== Phase B.2a: Building 13-gram decontaminated 100k multi-domain on-policy JSONL ==="
         python scripts/build_decontaminated_mix.py \
             --verifier-model "$VERIFIER_MODEL" \
-            --ultrachat-samples 31500 \
-            --openmath-samples 21000 \
-            --magicoder-samples 15500 \
+            --ultrachat-samples "$ULTRACHAT_SAMPLES" \
+            --openmath-samples "$OPENMATH_SAMPLES" \
+            --magicoder-samples "$MAGICODER_SAMPLES" \
             --exclude-benchmarks mt_bench gsm8k math500 humaneval mbpp livecodebench \
             --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
             --concurrency 64 \

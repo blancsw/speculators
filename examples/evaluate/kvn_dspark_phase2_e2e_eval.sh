@@ -11,13 +11,13 @@ set -euo pipefail
 
 VERIFIER_MODEL="${VERIFIER_MODEL:-Qwen/Qwen3-8B}"
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-/workspace/kvn_phase2_artifacts}"
-DATA_DIR="${DATA_DIR:-${ARTIFACT_ROOT}/data/qwen3_8b_mix68k_seq8192}"
+DATA_DIR="${DATA_DIR:-${ARTIFACT_ROOT}/data/qwen3_8b_mix100k_seq8192}"
 SAVE_ROOT="${SAVE_ROOT:-${ARTIFACT_ROOT}/checkpoints}"
 OUT_EVAL="${OUT_EVAL:-${ARTIFACT_ROOT}/eval_results}"
 DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32768}"
 VLLM_PORT="${VLLM_PORT:-8108}"
 SERVER_URL="http://localhost:${VLLM_PORT}"
-LAST_EPOCH="${LAST_EPOCH:-7}"
+LAST_EPOCH="${LAST_EPOCH:-5}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 EVAL_SCRIPT_DIR="${REPO_ROOT}/scripts/evaluate"

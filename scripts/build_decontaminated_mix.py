@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Build the decontaminated 68k multi-domain on-policy training & validation corpus for KvN-DSpark v2.
+"""Build the decontaminated 100k multi-domain on-policy training & validation corpus for KvN-DSpark v2.
 
 Implements Phase B of ``kvn_rff_rnn_mtp_train_phase_2.md``:
-1. Pulls strictly from **training** splits of three complementary domains:
-   - ``HuggingFaceH4/ultrachat_200k`` (``train_sft``): General dialogue & multi-turn instruction following
-   - ``nvidia/OpenMathInstruct-2`` (``train``): Long-horizon mathematical & CoT reasoning
-   - ``ise-uiuc/Magicoder-OSS-Instruct-75K`` (``train``): Code generation & algorithmic structure
+1. Pulls strictly from **training** splits of three complementary domains (100,000 total):
+   - ``HuggingFaceH4/ultrachat_200k`` (``train_sft``, 45k / 207.9k): General dialogue & multi-turn instruction following
+   - ``nvidia/OpenMathInstruct-2`` (``train``, 32k / 14M): Long-horizon mathematical & CoT reasoning
+   - ``ise-uiuc/Magicoder-OSS-Instruct-75K`` (``train``, 23k / 75.2k): Code generation & algorithmic structure
 2. Enforces **strict SHA-256 + normalized 13-gram decontamination** against downstream evaluation
    benchmarks (MT-Bench, GSM8K test, MATH-500, HumanEval, MBPP, LiveCodeBench, plus any custom JSONL).
 3. Assigns stratified sampling temperatures matching the Phase 2 protocol:
@@ -339,12 +339,12 @@ def collect_decontaminated_domain_samples(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build the decontaminated 68k multi-domain corpus for KvN-DSpark Phase 2."
+        description="Build the decontaminated 100k multi-domain corpus for KvN-DSpark Phase 2."
     )
     parser.add_argument("--verifier-model", type=str, default="Qwen/Qwen3-8B")
-    parser.add_argument("--ultrachat-samples", type=int, default=31500)
-    parser.add_argument("--openmath-samples", type=int, default=21000)
-    parser.add_argument("--magicoder-samples", type=int, default=15500)
+    parser.add_argument("--ultrachat-samples", type=int, default=45000)
+    parser.add_argument("--openmath-samples", type=int, default=32000)
+    parser.add_argument("--magicoder-samples", type=int, default=23000)
     parser.add_argument(
         "--exclude-benchmarks",
         nargs="+",
@@ -367,7 +367,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional separate path for the stratified held-out validation split.",
     )
-    parser.add_argument("--val-samples", type=int, default=3000)
+    parser.add_argument("--val-samples", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args(argv)
 

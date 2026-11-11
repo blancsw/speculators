@@ -127,6 +127,13 @@ def test_domain_normalizers_and_stratified_temperature_assignment():
     assert temps_om.count(0.0) == 50 and temps_om.count(0.6) == 50
     assert temps_mc.count(0.0) == 60 and temps_mc.count(0.6) == 40
 
+    parsed = mod.parse_args(["--output-jsonl", "dummy.jsonl"])
+    assert (
+        parsed.ultrachat_samples + parsed.openmath_samples + parsed.magicoder_samples
+        == 100_000
+    )
+    assert parsed.val_samples == 5_000
+
 
 # --------------------------------------------------------------------------- #
 # Phase D: Calibration (ECE, AUROC, Dynamic Stopping Pareto) & Amdahl Metrics
@@ -409,9 +416,11 @@ def test_h200_shell_scripts_syntax_and_all_11_configs_resolve_cleanly():
             cfg = TrainConfig.resolve(argv)
         flat = cfg.flatten()
         assert flat["speculator_type"] == "kvn_dspark"
+        assert flat["train_data_ratio"] == pytest.approx(0.95)
         if model_id == "A5_KvN_v2_Pruned128_Recal":
             assert flat["from_pretrained"] is not None
             assert flat["epochs"] == 1
         else:
             assert flat["num_layers"] == 5
             assert flat["draft_vocab_size"] == 32768
+            assert flat["epochs"] == 6
