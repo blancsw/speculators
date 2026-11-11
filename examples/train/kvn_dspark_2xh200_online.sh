@@ -15,11 +15,17 @@ set -euo pipefail
 # ============ Configuration ============
 MODEL="${MODEL:-Qwen/Qwen3-8B}"
 TARGET_LAYER_IDS="${TARGET_LAYER_IDS:-2 18 33}"
-DATASET="${DATASET:-hf:inference-optimization/speculators-ci-datasets:tutorial_regen}"
+# Leave DATASET empty (default) to auto-build the 13-gram decontaminated multi-domain
+# on-policy JSONL (45% UltraChat + 32% OpenMathInstruct-2 + 23% Magicoder) for $MODEL.
+DATASET="${DATASET:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-./output/kvn_dspark_v2_qwen3_8b}"
 HS_CACHE_DIR="${HS_CACHE_DIR:-/dev/shm/kvn_dspark_hs}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 MAX_SAMPLES="${MAX_SAMPLES:-100000}"
+ULTRACHAT_SAMPLES="${ULTRACHAT_SAMPLES:-$((MAX_SAMPLES * 45 / 100))}"
+OPENMATH_SAMPLES="${OPENMATH_SAMPLES:-$((MAX_SAMPLES * 32 / 100))}"
+MAGICODER_SAMPLES="${MAGICODER_SAMPLES:-$((MAX_SAMPLES - ULTRACHAT_SAMPLES - OPENMATH_SAMPLES))}"
+TRAIN_DATA_RATIO="${TRAIN_DATA_RATIO:-0.95}"
 SEQ_LENGTH="${SEQ_LENGTH:-8192}"
 EPOCHS="${EPOCHS:-6}"
 RECAL_EPOCHS="${RECAL_EPOCHS:-1}"
@@ -58,7 +64,7 @@ echo "=== Step 1: Launching vLLM server on GPU $VLLM_GPUS ($MODEL) ==="
 CUDA_VISIBLE_DEVICES="$VLLM_GPUS" python scripts/launch_vllm.py "$MODEL" \
     --target-layer-ids $TARGET_LAYER_IDS \
     --hidden-states-path "$HS_CACHE_DIR" \
-    -- --port "$VLLM_PORT" --gpu-memory-utilization 0.85 &
+    -- --port "$VLLM_PORT" --max-model-len "$SEQ_LENGTH" --gpu-memory-utilization 0.85 &
 VLLM_PID=$!
 
 cleanup() {
@@ -74,8 +80,26 @@ until curl -sf "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; do
 done
 echo "vLLM server ready."
 
-# Step 2: Prepare token IDs & token frequency distribution
-echo "=== Step 2: Preparing token dataset ($DATASET) in $OUTPUT_DIR ==="
+# Step 2: Build decontaminated multi-domain on-policy JSONL (if DATASET not pre-supplied) & prepare Arrow dataset
+if [[ -z "$DATASET" ]]; then
+    DATASET="${OUTPUT_DIR}_raw_onpolicy_${MAX_SAMPLES}.jsonl"
+    if [[ ! -f "$DATASET" ]]; then
+        echo "=== Step 2a: Building 13-gram decontaminated on-policy corpus ($MAX_SAMPLES samples) for $MODEL ==="
+        python scripts/build_decontaminated_mix.py \
+            --verifier-model "$MODEL" \
+            --ultrachat-samples "$ULTRACHAT_SAMPLES" \
+            --openmath-samples "$OPENMATH_SAMPLES" \
+            --magicoder-samples "$MAGICODER_SAMPLES" \
+            --exclude-benchmarks mt_bench gsm8k math500 humaneval mbpp livecodebench \
+            --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
+            --concurrency 64 \
+            --output-jsonl "$DATASET" \
+            --val-samples 0 \
+            --seed 42
+    fi
+fi
+
+echo "=== Step 2b: Preparing token dataset ($DATASET) in $OUTPUT_DIR ==="
 if [[ "$DATASET" == hf:* ]]; then
     speculators prepare-data \
         --model "$MODEL" \
@@ -102,6 +126,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" torchrun \
     -m speculators.train \
     --verifier-name-or-path "$MODEL" \
     --data-path "$OUTPUT_DIR" \
+    --train-data-ratio "$TRAIN_DATA_RATIO" \
     --hidden-states-path "$HS_CACHE_DIR" \
     --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
     --save-path "$OUTPUT_DIR/checkpoints" \
@@ -167,6 +192,7 @@ print('Saved Zero-Shot pruned checkpoint to:', '$PRUNED_PATH', 'State bytes/seq:
             --verifier-name-or-path "$MODEL" \
             --from-pretrained "$PRUNED_PATH" \
             --data-path "$OUTPUT_DIR" \
+            --train-data-ratio "$TRAIN_DATA_RATIO" \
             --hidden-states-path "$HS_CACHE_DIR" \
             --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
             --save-path "$OUTPUT_DIR/checkpoints/pruned_recal_m${KVN_N_MODES_INFER}" \

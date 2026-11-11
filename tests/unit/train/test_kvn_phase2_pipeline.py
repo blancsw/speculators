@@ -353,9 +353,12 @@ def test_h200_shell_scripts_syntax_and_all_11_configs_resolve_cleanly():
         _train_invocation_args,
     )
 
-    online_lines = (
+    online_text = (
         REPO_ROOT / "examples" / "train" / "kvn_dspark_2xh200_online.sh"
-    ).read_text(encoding="utf-8").splitlines()
+    ).read_text(encoding="utf-8")
+    assert "tutorial_regen" not in online_text
+    assert "scripts/build_decontaminated_mix.py" in online_text
+    online_lines = online_text.splitlines()
     online_probe = (
         "\n".join(_config_block(online_lines))
         + '\n__emit() { printf "%s\\n" "$@"; }\n__emit '
@@ -373,6 +376,7 @@ def test_h200_shell_scripts_syntax_and_all_11_configs_resolve_cleanly():
         warnings.simplefilter("error")
         online_flat = TrainConfig.resolve(out_online.stdout.splitlines()).flatten()
     assert online_flat["speculator_type"] == "kvn_dspark"
+    assert online_flat["train_data_ratio"] == pytest.approx(0.95)
     assert online_flat["kvn_n_modes"] == 512
     assert online_flat["kvn_reupload_dim"] == 512
     assert online_flat["kvn_anchor_rank"] == 512
