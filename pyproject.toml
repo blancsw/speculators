@@ -146,6 +146,9 @@ dev = [
 [project.entry-points.console_scripts]
 speculators = "speculators.__main__:app"
 
+[project.entry-points."vllm.general_plugins"]
+kvn_dspark = "speculators.vllm_integration.plugin:register_kvn_vllm_plugin"
+
 [project.urls]
 homepage = "https://github.com/vllm-project/speculators"
 source = "https://github.com/vllm-project/speculators"

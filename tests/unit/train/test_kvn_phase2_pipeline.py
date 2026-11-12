@@ -1,13 +1,17 @@
-"""TDD suite for KvN-DSpark Phase 2 data decontamination, calibration/Amdahl evaluation, and H200 CLI recipes."""
+"""TDD suite for KvN-DSpark Phase 2 data decontamination, calibration/Amdahl evaluation,
+and H200 CLI recipes.
+"""
+
+# ruff: noqa: E501, PLC0415, PT018, S603
 
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import warnings
+from pathlib import Path
 
 import pytest
 import torch
@@ -48,7 +52,8 @@ def test_decontamination_index_catches_sha256_and_13gram_leaks():
         "def has_close_elements(numbers: List[float], threshold: float) -> bool: Check if in given list of numbers, are any two numbers closer to each other than given threshold.",
     )
 
-    # 1. Exact prompt match (even with casing / extra spaces / punctuation differences) -> rejected
+    # 1. Exact prompt match (even with casing / extra spaces / punctuation differences)
+    # -> rejected
     exact_leak = [
         {
             "role": "user",
@@ -117,7 +122,9 @@ def test_domain_normalizers_and_stratified_temperature_assignment():
         },
     )
     assert uc is not None and len(uc) == 2 and uc[0]["role"] == "user"
-    assert om is not None and om[1]["role"] == "assistant" and "x = 4" in om[1]["content"]
+    assert (
+        om is not None and om[1]["role"] == "assistant" and "x = 4" in om[1]["content"]
+    )
     assert mc is not None and mc[0]["content"] == "Implement binary search."
 
     temps_uc = [mod.assign_sampling_temperature("ultrachat", i) for i in range(100)]
@@ -139,6 +146,7 @@ def test_livecodebench_fallback_and_token_exact_on_policy_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     import json
+
     import datasets
     import huggingface_hub
 
@@ -146,7 +154,8 @@ def test_livecodebench_fallback_and_token_exact_on_policy_resume(
         "build_decontaminated_mix", "scripts/build_decontaminated_mix.py"
     )
 
-    # 1. Verify livecodebench script-less fallback when load_dataset rejects legacy scripts
+    # 1. Verify livecodebench script-less fallback when load_dataset rejects legacy
+    # scripts
     fake_lcb = tmp_path / "test_lcb.jsonl"
     fake_lcb.write_text(
         json.dumps(
@@ -190,10 +199,12 @@ def test_livecodebench_fallback_and_token_exact_on_policy_resume(
     )
     assert leaked is True and "livecodebench" in reason
 
-    # 2. Verify token-exact boundary rows (input_ids + loss_mask), exact target_count replacement
+    # 2. Verify token-exact boundary rows (input_ids + loss_mask), exact target_count
+    # replacement
     #    after post-generation 13-gram rejection, and --resume idempotency
     fake_stream = [
-        # Multi-turn conversation (2 assistant turns -> 2 boundary rows; 2nd turn leaks -> rejected!)
+        # Multi-turn conversation (2 assistant turns -> 2 boundary rows; 2nd turn leaks
+        # -> rejected!)
         {
             "messages": [
                 {"role": "user", "content": "Explain damped harmonic oscillators."},
@@ -204,23 +215,32 @@ def test_livecodebench_fallback_and_token_exact_on_policy_resume(
         },
         {
             "messages": [
-                {"role": "user", "content": "Derive Bochner theorem for Gaussian kernels."},
+                {
+                    "role": "user",
+                    "content": "Derive Bochner theorem for Gaussian kernels.",
+                },
                 {"role": "assistant", "content": "orig 3"},
             ]
         },
         {
             "messages": [
-                {"role": "user", "content": "Show how symplectic integrators conserve energy."},
+                {
+                    "role": "user",
+                    "content": "Show how symplectic integrators conserve energy.",
+                },
                 {"role": "assistant", "content": "orig 4"},
             ]
         },
     ]
 
-    monkeypatch.setattr(
-        datasets,
-        "load_dataset",
-        lambda *a, **kw: datasets.Dataset.from_list(fake_stream),
-    )
+    def _fake_stream_or_lcb(path, *a, **kw):
+        if path == "livecodebench/code_generation_lite":
+            raise RuntimeError(
+                "Dataset scripts are no longer supported, but found code_generation_lite.py"
+            )
+        return datasets.Dataset.from_list(fake_stream)
+
+    monkeypatch.setattr(datasets, "load_dataset", _fake_stream_or_lcb)
 
     call_counter = {"n": 0}
 
@@ -285,7 +305,8 @@ def test_livecodebench_fallback_and_token_exact_on_policy_resume(
         assert len(row["input_ids"]) == len(row["loss_mask"]) == 5
         assert row["loss_mask"] == [0, 0, 0, 1, 1]
 
-    # Re-running with --resume when partial cache already has 3 clean rows makes 0 new LLM calls
+    # Re-running with --resume when partial cache already has 3 clean rows makes 0 new
+    # LLM calls
     prev_calls = call_counter["n"]
     out_jsonl_resume = tmp_path / "mix.jsonl"
     mod.main(
@@ -332,9 +353,9 @@ def test_ece_auroc_dynamic_stopping_and_amdahl_metrics():
 
     probs_overconf = torch.tensor([0.9, 0.9, 0.9, 0.9])
     labels_half = torch.tensor([1.0, 1.0, 0.0, 0.0])
-    assert eval_mod.compute_ece(probs_overconf, labels_half, num_bins=10) == pytest.approx(
-        0.4, abs=1e-6
-    )
+    assert eval_mod.compute_ece(
+        probs_overconf, labels_half, num_bins=10
+    ) == pytest.approx(0.4, abs=1e-6)
 
     # 2. Rejection AUROC: perfect separation -> 1.0, random inverted -> 0.0
     reject_scores = torch.tensor([0.95, 0.85, 0.20, 0.10])
@@ -344,8 +365,10 @@ def test_ece_auroc_dynamic_stopping_and_amdahl_metrics():
     )
 
     # 3. Dynamic block stopping Pareto curve
-    # Block 0: accepts first 3 tokens (k=0,1,2), rejects k=3..7; confidences drop below 0.5 at k=3
-    # Block 1: accepts first 1 token (k=0), rejects k=1..7; confidences drop below 0.5 at k=1
+    # Block 0: accepts first 3 tokens (k=0,1,2), rejects k=3..7; confidences drop below
+    # 0.5 at k=3
+    # Block 1: accepts first 1 token (k=0), rejects k=1..7; confidences drop below 0.5
+    # at k=1
     confidences = torch.tensor(
         [
             [0.95, 0.88, 0.76, 0.30, 0.20, 0.15, 0.10, 0.05],
@@ -362,7 +385,9 @@ def test_ece_auroc_dynamic_stopping_and_amdahl_metrics():
         confidences, accepted_flags, thresholds=[0.0, 0.5]
     )
     p_full = pareto[0]  # gamma=0.0 -> drafts all 8 slots, tau = 1 + (3 + 1)/2 = 3.0
-    p_dyn = pareto[1]   # gamma=0.5 -> drafts 3 and 1 slots (mean 2.0), preserves exact tau = 3.0 while saving 75% draft/verify slots!
+    p_dyn = pareto[
+        1
+    ]  # gamma=0.5 -> drafts 3 and 1 slots (mean 2.0), preserves exact tau = 3.0 while saving 75% draft/verify slots!
     assert p_full["mean_drafted_tokens"] == pytest.approx(8.0)
     assert p_full["mean_accept_length_tau"] == pytest.approx(3.0)
     assert p_dyn["mean_drafted_tokens"] == pytest.approx(2.0)
@@ -379,7 +404,9 @@ def test_ece_auroc_dynamic_stopping_and_amdahl_metrics():
     )
     assert amdahl["e2e_speedup"] == pytest.approx(2.5)
     assert amdahl["draft_overhead_fraction"] == pytest.approx(1.8 / 12.0)
-    assert amdahl["amdahl_theoretical_ceiling"] == pytest.approx(3.6 / (1.0 + 1.8 / 10.2))
+    assert amdahl["amdahl_theoretical_ceiling"] == pytest.approx(
+        3.6 / (1.0 + 1.8 / 10.2)
+    )
 
 
 def test_evaluate_checkpoint_calibration_end_to_end_cpu(tmp_path: Path):
@@ -387,6 +414,7 @@ def test_evaluate_checkpoint_calibration_end_to_end_cpu(tmp_path: Path):
     from safetensors.torch import save_file
     from transformers import Qwen3ForCausalLM
     from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+
     from speculators.config import SpeculatorsConfig, VerifierConfig
     from speculators.models.kvn_dspark import (
         KvNDSparkDraftModel,
@@ -463,7 +491,9 @@ def test_evaluate_checkpoint_calibration_end_to_end_cpu(tmp_path: Path):
     save_file(
         {
             "hidden_states": torch.randn(seq_len, 3, hidden_size, dtype=torch.bfloat16),
-            "token_ids": torch.randint(0, draft_vocab_size, (seq_len,), dtype=torch.long),
+            "token_ids": torch.randint(
+                0, draft_vocab_size, (seq_len,), dtype=torch.long
+            ),
         },
         str(hs_dir / "hs_0.safetensors"),
     )
@@ -487,6 +517,7 @@ def test_online_arrow_calibration_fallback_and_exact_e2e_spec_decoding(tmp_path:
     from datasets import Dataset
     from transformers import Qwen3ForCausalLM
     from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+
     from speculators.config import SpeculatorsConfig, VerifierConfig
     from speculators.models.kvn_dspark import (
         KvNDSparkDraftModel,
@@ -692,7 +723,8 @@ def test_h200_shell_scripts_syntax_and_all_11_configs_resolve_cleanly():
     assert online_flat["kvn_intrablock_mixer"] is True
     assert online_flat["kvn_strict_causal_shift"] is True
 
-    # 2. Verify all 9 orthogonal ablation models + post-prune recalibration in Phase 2 H200 suite
+    # 2. Verify all 9 orthogonal ablation models + post-prune recalibration in Phase 2
+    # H200 suite
     suite_text = (
         REPO_ROOT / "examples" / "train" / "kvn_dspark_phase2_h200_suite.sh"
     ).read_text(encoding="utf-8")
@@ -738,7 +770,8 @@ def test_h200_shell_scripts_syntax_and_all_11_configs_resolve_cleanly():
             if model_id == "A0_KvN_v1_CausalFix":
                 assert flat["kvn_reupload_dim"] == 0
 
-    # 3. Pre-flight ISO guards on vLLM --max-model-len (> SEQ_LENGTH) and Phase D eval script
+    # 3. Pre-flight ISO guards on vLLM --max-model-len (> SEQ_LENGTH) and Phase D eval
+    # script
     assert "VLLM_MAX_MODEL_LEN" in online_text
     assert '--max-model-len "$SEQ_LENGTH"' not in online_text
     assert "VLLM_MAX_MODEL_LEN" in suite_text

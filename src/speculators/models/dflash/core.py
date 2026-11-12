@@ -1,5 +1,4 @@
 import logging
-import os
 from typing import ClassVar
 
 import torch
@@ -33,9 +32,7 @@ logger = logging.getLogger(__name__)
 
 # Compile so the mask builds block-sparse instead of materializing DFlash's huge
 # dense [Q, KV] grid every step. (No benefit for EAGLE3's small autoregressive mask.)
-_compiled_create_block_mask = (
-    torch.compile(create_block_mask) if os.name != "nt" else create_block_mask
-)
+_compiled_create_block_mask = torch.compile(create_block_mask)
 
 
 @SpeculatorModel.register("dflash")
@@ -243,7 +240,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             verifier_config.is_causal = kwargs["causal_attention"]
         block_size = kwargs.get("block_size", 8)
 
-        default_sample_from_anchor = algorithm in ("dspark", "kvn_dspark")
+        default_sample_from_anchor = algorithm == "dspark"
         sample_from_anchor_arg = kwargs.get("sample_from_anchor")
         sample_from_anchor = (
             default_sample_from_anchor

@@ -42,7 +42,12 @@ SEQ_LENGTH="${SEQ_LENGTH:-8192}"
 # Keep vLLM context strictly > SEQ_LENGTH so /render and /chat/completions never hit HTTP 400 (max_tokens >= 1)
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-$((SEQ_LENGTH + 4096))}"
 EPOCHS="${EPOCHS:-6}"
+RECAL_EPOCHS="${RECAL_EPOCHS:-1}"
+ISO_COMPUTE_PRUNE="${ISO_COMPUTE_PRUNE:-0}"
+LASSO_EPOCHS="${LASSO_EPOCHS:-$((ISO_COMPUTE_PRUNE == 1 ? EPOCHS - RECAL_EPOCHS : EPOCHS))}"
 TRAIN_DATA_RATIO="${TRAIN_DATA_RATIO:-0.95}"
+MIN_SHM_MB="${MIN_SHM_MB:-32768}"
+SKIP_SHM_CHECK="${SKIP_SHM_CHECK:-0}"
 SKIP_DATA_PREP="${SKIP_DATA_PREP:-0}"
 
 # Build exact speculators.train CLI argv for any of the 9 orthogonal ablation models
@@ -99,6 +104,7 @@ emit_train_argv() {
                 --save-path "${SAVE_ROOT}/${model_id}_s${seed}"
                 --kvn-backbone-type swa
                 --no-kvn-use-born-confidence
+                --kvn-lasso-weight 0.0
             )
             ;;
         B2_DSpark_SWA512)
@@ -108,6 +114,7 @@ emit_train_argv() {
                 --save-path "${SAVE_ROOT}/${model_id}_s${seed}"
                 --kvn-backbone-type swa
                 --no-kvn-use-born-confidence
+                --kvn-lasso-weight 0.0
             )
             ;;
         B3_Hybrid_1SWA_4KvN)
@@ -127,7 +134,7 @@ emit_train_argv() {
                 --kvn-intrablock-mixer
                 --kvn-strict-causal-shift
                 --kvn-use-born-confidence
-                --kvn-lasso-weight 1e-5
+                --kvn-lasso-weight 0.0
             )
             ;;
         A0_KvN_v1_CausalFix)
@@ -147,7 +154,7 @@ emit_train_argv() {
                 --no-kvn-intrablock-mixer
                 --kvn-strict-causal-shift
                 --kvn-use-born-confidence
-                --kvn-lasso-weight 1e-5
+                --kvn-lasso-weight 0.0
             )
             ;;
         A1_KvN_ModalRFF_Comp)
@@ -167,7 +174,7 @@ emit_train_argv() {
                 --no-kvn-intrablock-mixer
                 --kvn-strict-causal-shift
                 --kvn-use-born-confidence
-                --kvn-lasso-weight 1e-5
+                --kvn-lasso-weight 0.0
             )
             ;;
         A2_KvN_Multilayer)
@@ -187,7 +194,7 @@ emit_train_argv() {
                 --no-kvn-intrablock-mixer
                 --kvn-strict-causal-shift
                 --kvn-use-born-confidence
-                --kvn-lasso-weight 1e-5
+                --kvn-lasso-weight 0.0
             )
             ;;
         A3_KvN_IntraBlock)
@@ -207,7 +214,7 @@ emit_train_argv() {
                 --kvn-intrablock-mixer
                 --kvn-strict-causal-shift
                 --no-kvn-use-born-confidence
-                --kvn-lasso-weight 1e-5
+                --kvn-lasso-weight 0.0
             )
             ;;
         A4_KvN_v2_Full128)
@@ -227,12 +234,13 @@ emit_train_argv() {
                 --kvn-intrablock-mixer
                 --kvn-strict-causal-shift
                 --kvn-use-born-confidence
-                --kvn-lasso-weight 1e-5
+                --kvn-lasso-weight 0.0
             )
             ;;
         A5_KvN_v2_LASSO_512to128)
             specific_args=(
                 "${scratch_common[@]}"
+                --epochs "$LASSO_EPOCHS"
                 --sliding-window 128
                 --save-path "${SAVE_ROOT}/${model_id}_s${seed}"
                 --kvn-backbone-type kvn
@@ -254,7 +262,7 @@ emit_train_argv() {
             specific_args=(
                 --from-pretrained "${SAVE_ROOT}/A5_KvN_v2_Pruned128_ZeroShot_s${seed}"
                 --save-path "${SAVE_ROOT}/${model_id}_s${seed}"
-                --epochs 1
+                --epochs "$RECAL_EPOCHS"
                 --lr 5e-5
                 --muon-lr 2e-4
                 --kvn-lasso-weight 0.0
@@ -275,6 +283,16 @@ if [[ "${1:-}" == "--dry-run-lib" ]]; then
 fi
 
 set -euo pipefail
+
+if [[ "$SKIP_SHM_CHECK" != "1" && -d "/dev/shm" ]]; then
+    SHM_AVAIL_MB="$(df -Pm /dev/shm | awk 'NR==2 {print $4}')"
+    if [[ -n "$SHM_AVAIL_MB" && "$SHM_AVAIL_MB" -lt "$MIN_SHM_MB" ]]; then
+        echo "ERROR: /dev/shm has only ${SHM_AVAIL_MB} MB free (< MIN_SHM_MB=${MIN_SHM_MB} MB)." >&2
+        echo "Relaunch container with '--shm-size=64g' (or point HS_CACHE_DIR to fast NVMe)." >&2
+        exit 1
+    fi
+fi
+
 mkdir -p "$DATA_DIR" "$SAVE_ROOT" "$HS_CACHE_DIR"
 
 VLLM_PID=""
@@ -343,7 +361,7 @@ run_model_seed() {
         -m speculators.train "${train_argv[@]}"
 
     if [[ "$model_id" == "A5_KvN_v2_LASSO_512to128" ]]; then
-        local last_ep=$((EPOCHS - 1))
+        local last_ep=$((LASSO_EPOCHS - 1))
         local ckpt_dir="${SAVE_ROOT}/${model_id}_s${seed}/${last_ep}"
         local pruned_dir="${SAVE_ROOT}/A5_KvN_v2_Pruned128_ZeroShot_s${seed}"
         echo "=== Pruning ${model_id} (512 -> 128 dyadic modes, zero-shot) ==="

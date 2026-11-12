@@ -1,4 +1,6 @@
-"""Unit tests for KvN-DSpark Phase 2 (Dequantized Damped Bosonic SSM + Vacuum Born v2)."""
+"""Unit tests for KvN-DSpark Phase 2 (Dequantized Damped Bosonic SSM + Vacuum Born)."""
+
+# ruff: noqa: PLC0415, PT018
 
 from __future__ import annotations
 
@@ -65,31 +67,63 @@ def _make_v2_speculator_config(
             algorithm="kvn_dspark",
             proposal_methods=[GreedyTokenProposalConfig(speculative_tokens=block_size)],
             default_proposal_method="greedy",
-            verifier=VerifierConfig(name_or_path=None, architectures=["Qwen3ForCausalLM"]),
+            verifier=VerifierConfig(
+                name_or_path=None, architectures=["Qwen3ForCausalLM"]
+            ),
         ),
         **extra_kwargs,
     )
 
 
 def test_gqa_state_memory_accounting_qwen3_8b():
-    """Verify exact GQA KV dimension (8 * 128 = 1024) yields 2.62 MB/seq and 1024x ratio."""
+    """Verify exact GQA KV dimension (8 * 128 = 1024) yields 2.62 MB/seq and exact v2/v3
+    byte accounting.
+    """
     tl_cfg = _make_qwen3_8b_like_tl_config()
     swa_cfg = _make_v2_speculator_config(tl_cfg, backbone_type="swa", n_modes=128)
-    kvn_bf16_cfg = _make_v2_speculator_config(
-        tl_cfg, backbone_type="kvn", n_modes=128, kvn_state_dtype="bfloat16"
+    kvn_bf16_v2_cfg = _make_v2_speculator_config(
+        tl_cfg,
+        backbone_type="kvn",
+        n_modes=128,
+        kvn_state_dtype="bfloat16",
+        use_lindblad_purity=False,
     )
-    kvn_fp32_cfg = _make_v2_speculator_config(
-        tl_cfg, backbone_type="kvn", n_modes=128, kvn_state_dtype="float32"
+    kvn_fp32_v2_cfg = _make_v2_speculator_config(
+        tl_cfg,
+        backbone_type="kvn",
+        n_modes=128,
+        kvn_state_dtype="float32",
+        use_lindblad_purity=False,
     )
-    hyb_cfg = _make_v2_speculator_config(
-        tl_cfg, backbone_type="hybrid_1swa_2kvn", n_modes=128, kvn_state_dtype="bfloat16"
+    hyb_v2_cfg = _make_v2_speculator_config(
+        tl_cfg,
+        backbone_type="hybrid_1swa_2kvn",
+        n_modes=128,
+        kvn_state_dtype="bfloat16",
+        use_lindblad_purity=False,
+    )
+    kvn_v3_default_cfg = _make_v2_speculator_config(
+        tl_cfg, backbone_type="kvn", n_modes=128
     )
 
     assert swa_cfg.estimated_state_bytes_per_seq() == 2_621_440
-    assert kvn_bf16_cfg.estimated_state_bytes_per_seq() == 2_560
-    assert swa_cfg.estimated_state_bytes_per_seq() // kvn_bf16_cfg.estimated_state_bytes_per_seq() == 1024
-    assert kvn_fp32_cfg.estimated_state_bytes_per_seq() == 5_120
-    assert hyb_cfg.estimated_state_bytes_per_seq() == 526_336
+    assert kvn_bf16_v2_cfg.estimated_state_bytes_per_seq() == 2_560
+    assert (
+        swa_cfg.estimated_state_bytes_per_seq()
+        // kvn_bf16_v2_cfg.estimated_state_bytes_per_seq()
+        == 1024
+    )
+    assert kvn_fp32_v2_cfg.estimated_state_bytes_per_seq() == 5_120
+    assert hyb_v2_cfg.estimated_state_bytes_per_seq() == 526_336
+
+    # v3 default: FP32 (q, p, nu) = 5 * 3 * 128 * 4 = 7,680 B (+ 8,192 B optional
+    # fc_{t-1} cache)
+    assert kvn_v3_default_cfg.kvn_state_dtype == "float32"
+    assert kvn_v3_default_cfg.estimated_state_bytes_per_seq() == 7_680
+    breakdown = kvn_v3_default_cfg.estimated_state_bytes_breakdown()
+    assert breakdown["recurrent_state_bytes"] == 7_680
+    assert breakdown["fc_boundary_cache_bytes"] == 8_192
+    assert breakdown["total_serving_bytes"] == 15_872
 
 
 def test_new_v2_cli_flags_resolution():
@@ -130,7 +164,7 @@ def test_new_v2_cli_flags_resolution():
 
 
 def test_spectral_params_routed_to_adamw_not_muon():
-    """Verify spectral frequencies, dyadic angles, and multi-layer weights bypass Muon NS."""
+    """Verify spectral frequencies, dyadic angles, and layer weights bypass Muon NS."""
 
     class _DummySpectralModule(nn.Module):
         def __init__(self) -> None:
@@ -154,7 +188,7 @@ def test_spectral_params_routed_to_adamw_not_muon():
 
 
 def test_modal_data_reuploading_rff_compression_and_sqrt_l_scaling():
-    """Verify ModalDataReuploadingRFF compresses params, scales std as 1/sqrt(L*d_re), and keeps final sin/cos active."""
+    """Verify ModalDataReuploadingRFF compression, 1/sqrt(L*d_re) scale, and sin/cos."""
     from speculators.models.kvn_dspark.model_definitions import (
         DataReuploadingLinear,
         ModalDataReuploadingRFF,
@@ -169,6 +203,7 @@ def test_modal_data_reuploading_rff_compression_and_sqrt_l_scaling():
         d_re=64,
         sigma_g=1.2,
         learnable_rff=True,
+        dyadic_rff=False,
     )
 
     legacy_params = sum(p.numel() for p in legacy.parameters())
@@ -178,6 +213,20 @@ def test_modal_data_reuploading_rff_compression_and_sqrt_l_scaling():
 
     expected_std = 1.2 / (3 * 64) ** 0.5
     assert modal.omega_rff.std().item() == pytest.approx(expected_std, rel=0.15)
+
+    modal_dyadic = ModalDataReuploadingRFF(
+        d_model=256,
+        n_modes=32,
+        reupload_layers_l=3,
+        d_re=64,
+        sigma_g=1.2,
+        learnable_rff=True,
+        dyadic_rff=True,
+    )
+    expected_dyadic_std = 1.2 / (((4**3 - 1) / 3.0) * 64) ** 0.5
+    assert modal_dyadic.omega_rff.std().item() == pytest.approx(
+        expected_dyadic_std, rel=0.15
+    )
 
     x = torch.randn(2, 10, 256, requires_grad=True)
     r_q, r_p = modal(x)
@@ -189,7 +238,7 @@ def test_modal_data_reuploading_rff_compression_and_sqrt_l_scaling():
 
 
 def test_multipacking_document_boundary_isolation_in_layer():
-    """Verify reset_mask isolates packed documents with zero cross-document state leakage."""
+    """Verify reset_mask isolates packed documents with zero cross-doc state leak."""
     from speculators.models.kvn_dspark.model_definitions import CausalKvNRFFLayer
 
     torch.manual_seed(21)
@@ -220,7 +269,9 @@ def test_multipacking_document_boundary_isolation_in_layer():
 
 
 def test_segmented_scan_matches_step_by_step_recurrent_with_resets():
-    """Verify parallel Kogge-Stone segmented scan matches step-by-step O(1) recurrence across resets."""
+    """Verify parallel Kogge-Stone segmented scan matches step-by-step O(1) recurrence
+    across resets.
+    """
     from speculators.models.kvn_dspark.model_definitions import CausalKvNRFFLayer
 
     torch.manual_seed(33)
@@ -256,7 +307,9 @@ def test_segmented_scan_matches_step_by_step_recurrent_with_resets():
 
 
 def test_interferometer_restores_phase_gradient_and_vacuum_born_properties():
-    """Verify beamsplitters restore non-zero phase gradients in BornConfidenceHead and simplex/decay hold."""
+    """Verify beamsplitters restore non-zero phase gradients in BornConfidenceHead and
+    simplex/decay hold.
+    """
     from speculators.models.kvn_dspark.model_definitions import (
         BornConfidenceHead,
         MultiHorizonKoopmanRollout,
@@ -308,7 +361,7 @@ def test_interferometer_restores_phase_gradient_and_vacuum_born_properties():
 
 
 def test_intrablock_causal_mixer_strict_horizon_causality():
-    """Verify IntraBlockCausalMixer mixes horizons k=0..K-1 causally with zero future leak."""
+    """Verify IntraBlockCausalMixer mixes horizons k=0..K-1 with zero future leak."""
     from speculators.models.kvn_dspark.model_definitions import IntraBlockCausalMixer
 
     torch.manual_seed(55)
@@ -327,7 +380,7 @@ def test_intrablock_causal_mixer_strict_horizon_causality():
 
 @pytest.mark.parametrize("vacuum_born_norm", [True, False])
 def test_exact_dyadic_lasso_pruning_zero_error_dead_modes(vacuum_born_norm: bool):
-    """Verify pruning dead oscillator dyads (q=p=0, arbitrary non-zero readout weights) has zero error across all 3 heads."""
+    """Verify pruning dead oscillator dyads has zero error across all 3 heads."""
     from speculators.models.kvn_dspark.model_definitions import (
         BornConfidenceHead,
         CausalKvNRFFLayer,
@@ -360,12 +413,14 @@ def test_exact_dyadic_lasso_pruning_zero_error_dead_modes(vacuum_born_norm: bool
 
     # Make dyads 8..15 (modes 16..31) dead oscillators (zero input gain -> q=p=0),
     # while keeping readout weights NON-ZERO on modes 0..15 and zeroing importance ONLY
-    # for ranking via tiny weights vs large weights on 0..15 — Wait: test NON-ZERO weights
+    # for ranking via tiny weights vs large weights on 0..15 — Wait: test NON-ZERO
+    # weights
     # on modes 16..31 by passing explicit keep_indices = [0..15] or making 0..15 larger!
     with torch.no_grad():
         layer.in_gain_q[16:] = 0.0
         layer.in_gain_p[16:] = 0.0
-        # Ensure modes 0..15 strictly win top-k importance while modes 16..31 still have non-zero weights!
+        # Ensure modes 0..15 strictly win top-k importance while modes 16..31 still have
+        # non-zero weights!
         layer.readout_linear.weight[:, :16] *= 10.0
         layer.readout_linear.weight[:, 32:48] *= 10.0
         layer.readout_linear.weight[:, 64:80] *= 10.0
@@ -380,7 +435,9 @@ def test_exact_dyadic_lasso_pruning_zero_error_dead_modes(vacuum_born_norm: bool
     )
     conf_before = conf_head(h_blk_before, born_features=born_before)
 
-    top_idx = layer.prune_to_top_modes(16, compensate_zero_state_bias=not vacuum_born_norm)
+    top_idx = layer.prune_to_top_modes(
+        16, compensate_zero_state_bias=not vacuum_born_norm
+    )
     assert torch.equal(top_idx.cpu(), torch.arange(16))
     rollout.prune_to_indices(top_idx, compensate_zero_state_bias=not vacuum_born_norm)
     conf_head.prune_born_modes(top_idx, compensate_zero_state_bias=not vacuum_born_norm)
@@ -409,7 +466,7 @@ def _init_dummy_draft_weights(model) -> None:
 
 @pytest.mark.parametrize("backbone_type", ["kvn", "hybrid_1swa_2kvn"])
 def test_zero_anchor_causal_leakage_in_draft_model(backbone_type: str):
-    """Verify mutating hidden_states[:, a:, :] (including anchor a itself!) has ZERO effect on block logits at anchor a."""
+    """Verify mutating hidden_states[:, a:, :] has ZERO effect on logits at anchor a."""
     from speculators.models.kvn_dspark.core import KvNDSparkDraftModel
 
     torch.manual_seed(101)
@@ -437,8 +494,9 @@ def test_zero_anchor_causal_leakage_in_draft_model(backbone_type: str):
 
     input_ids = torch.randint(0, 128, (1, seq_len))
     loss_mask = torch.zeros(1, seq_len, dtype=torch.bool)
-    loss_mask[0, 6] = True
-    loss_mask[0, 14] = True
+    # Pin anchors a=6 and a=14 under sample_from_anchor=True (predicting 7 and 15)
+    loss_mask[0, 7] = True
+    loss_mask[0, 15] = True
     verifier_last_hs = torch.randn(1, seq_len, 64)
     document_ids = torch.zeros(1, seq_len, dtype=torch.long)
 
@@ -464,7 +522,9 @@ def test_zero_anchor_causal_leakage_in_draft_model(backbone_type: str):
 
 
 def test_end_to_end_multipacking_document_isolation_in_draft_model():
-    """Verify KvNDSparkDraftModel isolates packed documents across both fc shift and recurrent scan."""
+    """Verify KvNDSparkDraftModel isolates packed documents across both fc shift and
+    recurrent scan.
+    """
     from speculators.models.kvn_dspark.core import KvNDSparkDraftModel
 
     torch.manual_seed(202)
@@ -477,7 +537,9 @@ def test_end_to_end_multipacking_document_isolation_in_draft_model():
         sliding_window=32,
         vocab_size=128,
     )
-    cfg = _make_v2_speculator_config(tl_cfg, backbone_type="kvn", n_modes=32, block_size=4)
+    cfg = _make_v2_speculator_config(
+        tl_cfg, backbone_type="kvn", n_modes=32, block_size=4
+    )
     model = KvNDSparkDraftModel(cfg)
     _init_dummy_draft_weights(model)
     model.eval()
@@ -492,8 +554,10 @@ def test_end_to_end_multipacking_document_isolation_in_draft_model():
     ids2[:, :16] = (ids1[:, :16] + 37) % 128
 
     loss_mask = torch.zeros(1, seq_len, dtype=torch.bool)
-    loss_mask[0, 16] = True  # Anchor right at the first token of doc 1!
-    loss_mask[0, 22] = True
+    loss_mask[0, 17] = (
+        True  # Anchor a=16 right at the first token of doc 1 (predicting 17)!
+    )
+    loss_mask[0, 23] = True
     verifier_last_hs = torch.randn(1, seq_len, 64)
     document_ids = torch.cat(
         [torch.zeros(1, 16, dtype=torch.long), torch.ones(1, 16, dtype=torch.long)],
@@ -520,7 +584,9 @@ def test_end_to_end_multipacking_document_isolation_in_draft_model():
 
 
 def test_multilayer_rollout_and_intrablock_mixer_wiring_and_pruning():
-    """Verify multi-layer modal rollout + IntraBlockCausalMixer zero-error pruning invariance."""
+    """Verify multi-layer modal rollout + IntraBlockCausalMixer zero-error pruning
+    invariance.
+    """
     from speculators.models.kvn_dspark.core import KvNDSparkDraftModel
 
     torch.manual_seed(303)
@@ -554,6 +620,8 @@ def test_multilayer_rollout_and_intrablock_mixer_wiring_and_pruning():
             layer.readout_linear.weight[:, 16:m] = 0.0
             layer.readout_linear.weight[:, m + 16 : 2 * m] = 0.0
             layer.readout_linear.weight[:, 2 * m + 16 : 3 * m] = 0.0
+            if layer.butterfly_couple_gate is not None:
+                layer.butterfly_couple_gate[16:m] = 0.0
         m = model.rollout.n_modes
         model.rollout.obs_linear.weight[:, 16:m] = 0.0
         model.rollout.obs_linear.weight[:, m + 16 : 2 * m] = 0.0
@@ -561,13 +629,21 @@ def test_multilayer_rollout_and_intrablock_mixer_wiring_and_pruning():
         assert model.born_confidence_head is not None
         assert model.born_confidence_head.born_proj is not None
         model.born_confidence_head.born_proj.weight[:, 16:m] = 0.0
+        if model.born_confidence_head.vacuum_pvac_proj is not None:
+            model.born_confidence_head.vacuum_pvac_proj.weight[:, 8 : m // 2] = 0.0
+        if model.born_confidence_head.lindblad_purity_proj is not None:
+            model.born_confidence_head.lindblad_purity_proj.weight[:, 16:m] = 0.0
+        if model.kraus_head is not None:
+            model.kraus_head.kraus_mode_gate[16:m] = 0.0
+            model.kraus_head.kraus_backaction_proj.weight[:, 16:m] = 0.0
+            model.kraus_head.kraus_backaction_proj.weight[:, m + 16 : 2 * m] = 0.0
 
     seq_len = 20
     hs = torch.randn(1, seq_len, 3 * 64)
     ids = torch.randint(0, 128, (1, seq_len))
     loss_mask = torch.zeros(1, seq_len, dtype=torch.bool)
-    loss_mask[0, 5] = True
-    loss_mask[0, 12] = True
+    loss_mask[0, 6] = True
+    loss_mask[0, 13] = True
     v_hs = torch.randn(1, seq_len, 64)
     doc_ids = torch.zeros(1, seq_len, dtype=torch.long)
 
@@ -589,7 +665,7 @@ def test_multilayer_rollout_and_intrablock_mixer_wiring_and_pruning():
 
 
 def test_advance_and_draft_step_matches_prefill_and_fullgraph_compiles():
-    """Verify static-shape vLLM advance_and_draft_step matches prefill rollout and compiles fullgraph."""
+    """Verify static-shape advance_and_draft_step matches prefill and compiles."""
     from speculators.models.kvn_dspark.core import KvNDSparkDraftModel
 
     torch.manual_seed(404)
@@ -617,11 +693,12 @@ def test_advance_and_draft_step_matches_prefill_and_fullgraph_compiles():
     hs = torch.randn(1, seq_len, 3 * 64)
     ids = torch.randint(0, 128, (1, seq_len))
     loss_mask = torch.zeros(1, seq_len, dtype=torch.bool)
-    loss_mask[0, 6] = True  # Anchor at position 6
+    loss_mask[0, 7] = True  # Anchor at position 6 (predicting position 7)
     v_hs = torch.randn(1, seq_len, 64)
     doc_ids = torch.zeros(1, seq_len, dtype=torch.long)
 
-    # 1. Full sequence forward up to anchor a=6 -> extract greedy autoregressive block tokens
+    # 1. Full sequence forward up to anchor a=6 -> extract greedy autoregressive block
+    # tokens
     hidden, base_logits, _, _, _, born_feat = model._kvn_backbone_forward(
         hs, ids, loss_mask, v_hs, doc_ids, max_anchors=1
     )
@@ -632,13 +709,14 @@ def test_advance_and_draft_step_matches_prefill_and_fullgraph_compiles():
         born_features=born_feat,
     )
 
-    # 2. Incremental static-shape vLLM execution in 2 chunks: [0..4] (len=5) then [5..6] (len=2, padded to S_max=5)
+    # 2. Incremental static-shape vLLM execution in 2 chunks: [0..4] (len=5) then [5..6]
+    # (len=2, padded to S_max=5)
     fc_all = model.hidden_norm(model.fc(hs))
     fc_shifted = torch.zeros_like(fc_all)
     fc_shifted[:, 1:, :] = fc_all[:, :-1, :]
 
     state_cache = model.allocate_state_cache(batch_size=1, device=hs.device)
-    assert state_cache.shape == (3, 2, 1, 16)
+    assert state_cache.shape == (3, 3, 1, 16)
 
     # Chunk 1: tokens 0..4 (valid_lens = 5)
     model.advance_and_draft_step(
@@ -671,7 +749,9 @@ def test_advance_and_draft_step_matches_prefill_and_fullgraph_compiles():
 
 
 def test_lasso_weight_trainer_kwargs_override_and_eval_iso_loss():
-    """Verify --kvn-lasso-weight override in get_trainer_kwargs, zero LASSO in eval, and prune_kvn_modes reset."""
+    """Verify --kvn-lasso-weight override in get_trainer_kwargs, zero LASSO in eval, and
+    prune_kvn_modes reset.
+    """
     from speculators.models.kvn_dspark.core import KvNDSparkDraftModel
 
     torch.manual_seed(505)
@@ -713,7 +793,7 @@ def test_lasso_weight_trainer_kwargs_override_and_eval_iso_loss():
     hs = torch.randn(1, seq_len, 3 * 64)
     ids = torch.randint(0, 128, (1, seq_len))
     loss_mask = torch.zeros(1, seq_len, dtype=torch.bool)
-    loss_mask[0, 5] = True
+    loss_mask[0, 6] = True
     v_hs = torch.randn(1, seq_len, 64)
     doc_ids = torch.zeros(1, seq_len, dtype=torch.long)
 
@@ -738,8 +818,9 @@ def test_lasso_weight_trainer_kwargs_override_and_eval_iso_loss():
 
 
 def test_config_roundtrip_and_slim_checkpoint_key_ownership(tmp_path):
-    """Verify KvNDSparkSpeculatorConfig registry round-trip and verifier weight omission on save."""
+    """Verify KvNDSparkSpeculatorConfig registry round-trip and slim save."""
     from safetensors.torch import load_file
+
     from speculators import SpeculatorModel, SpeculatorModelConfig
     from speculators.models.kvn_dspark.core import KvNDSparkDraftModel
 
@@ -779,4 +860,3 @@ def test_config_roundtrip_and_slim_checkpoint_key_ownership(tmp_path):
     assert omitted.isdisjoint(red_keys)
     assert "lm_head.weight" in red_keys
     assert {"t2d", "d2t"}.issubset(red_keys)
-

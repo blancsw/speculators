@@ -21,6 +21,7 @@ from transformers import PretrainedConfig
 
 from speculators.convert.dflash.converter import DFlashConverter
 from speculators.convert.eagle.eagle3_converter import Eagle3Converter
+from speculators.convert.kvn_dspark.converter import KvNDSparkConverter
 from speculators.convert.mtp.converter import MTPConverter
 
 __all__ = ["convert_model", "maybe_convert_external_checkpoint"]
@@ -29,7 +30,7 @@ __all__ = ["convert_model", "maybe_convert_external_checkpoint"]
 def convert_model(
     model: str,
     verifier: str,
-    algorithm: Literal["eagle3", "mtp", "dflash"],
+    algorithm: Literal["eagle3", "mtp", "dflash", "kvn_dspark"],
     output_path: str = "converted",
     validate_device: str | None = None,
     **kwargs,
@@ -106,6 +107,14 @@ def convert_model(
         )
     elif algorithm == "dflash":
         DFlashConverter().convert(
+            model,
+            output_path,
+            verifier,
+            validate=validate_device is not None,
+            **kwargs,
+        )
+    elif algorithm == "kvn_dspark":
+        KvNDSparkConverter().convert(
             model,
             output_path,
             verifier,

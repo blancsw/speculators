@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import dataclasses
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows compatibility
-    fcntl = None  # type: ignore[assignment]
 import os
 import socket
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows compatibility
+    fcntl = None  # type: ignore[assignment]
 
 import torch
 from safetensors.torch import load_file

@@ -1,0 +1,540 @@
+{
+  "benchmark_suite": "KvN-DSpark v3 Local RTX 3070 Ti Pre-H200 Go-Live Validation",
+  "timestamp_utc": "2026-11-12T13:51:01Z",
+  "hardware": {
+    "gpu_name": "NVIDIA GeForce RTX 3070 Ti Laptop GPU",
+    "vram_total_mib": 8191.5,
+    "torch_version": "2.14.1+cu132",
+    "cuda_version": "13.2"
+  },
+  "verifier_model": "Qwen/Qwen3.5-0.8B",
+  "verifier_vocab_size": 248320,
+  "draft_vocab_size": 4096,
+  "target_layer_ids": [
+    2,
+    12,
+    21
+  ],
+  "seq_len": 256,
+  "iso_compute_epochs_per_model": 6,
+  "dataset_integrity": {
+    "num_samples": 40,
+    "num_train_conversations": 32,
+    "num_val_conversations": 8,
+    "sibling_conversation_overlap": 0,
+    "token_freq_source": "train_only",
+    "unique_train_assistant_tokens": 2252,
+    "prep_wall_time_s": 174.68
+  },
+  "num_held_out_eval_prompts": 8,
+  "max_eval_new_tokens": 24,
+  "models": [
+    {
+      "id": "B1_SWA",
+      "backbone_type": "swa",
+      "is_v3_architecture": false,
+      "total_iso_compute_epochs": 6,
+      "train_modes": 128,
+      "infer_modes": 128,
+      "trainable_params": 85307393,
+      "active_params_with_lm_head": 89501697,
+      "dynamical_state_bytes_per_seq": 786432,
+      "chunk_boundary_fc_bytes_per_seq": 0,
+      "total_slot_bytes_per_seq": 786432,
+      "train_wall_time_s": 70.71,
+      "train_loss": 0.7168,
+      "val_loss": 0.7083,
+      "val_pos0_shortlist_acc_pct": 19.79,
+      "exact_full_vocab_pos0_acc_pct": 34.91,
+      "val_accept_len_tau": 1.2157,
+      "val_greedy_eal": 1.2292,
+      "e2e_linear_T0.0_tau": 1.1018,
+      "e2e_linear_T0.0_exact_greedy_parity": true,
+      "e2e_linear_T0.6_tau": 1.122,
+      "kraus_tree_specinfer": null,
+      "calibration_15bin_ece": 0.0763,
+      "calibration_rejection_auroc": 0.7623,
+      "dynamic_stopping_pareto": [
+        {
+          "gamma_conf": 0.0,
+          "mean_drafted_tokens": 8.0,
+          "mean_accept_length_tau": 1.4009,
+          "verifier_slot_flops_saved_pct": 0.0
+        },
+        {
+          "gamma_conf": 0.2,
+          "mean_drafted_tokens": 0.5129,
+          "mean_accept_length_tau": 1.2586,
+          "verifier_slot_flops_saved_pct": 93.59
+        },
+        {
+          "gamma_conf": 0.35,
+          "mean_drafted_tokens": 0.2414,
+          "mean_accept_length_tau": 1.1681,
+          "verifier_slot_flops_saved_pct": 96.98
+        },
+        {
+          "gamma_conf": 0.5,
+          "mean_drafted_tokens": 0.1293,
+          "mean_accept_length_tau": 1.1034,
+          "verifier_slot_flops_saved_pct": 98.38
+        },
+        {
+          "gamma_conf": 0.65,
+          "mean_drafted_tokens": 0.0948,
+          "mean_accept_length_tau": 1.0776,
+          "verifier_slot_flops_saved_pct": 98.81
+        },
+        {
+          "gamma_conf": 0.8,
+          "mean_drafted_tokens": 0.0345,
+          "mean_accept_length_tau": 1.0345,
+          "verifier_slot_flops_saved_pct": 99.57
+        }
+      ],
+      "proximal_lasso_pruning": null,
+      "batched_drafter_latency_and_vram": {
+        "1": {
+          "step_latency_ms": 20.1142,
+          "draft_tokens_per_s": 397.7,
+          "peak_vram_mb": 776.08
+        },
+        "8": {
+          "step_latency_ms": 19.562,
+          "draft_tokens_per_s": 3271.7,
+          "peak_vram_mb": 796.97
+        },
+        "32": {
+          "step_latency_ms": 19.71,
+          "draft_tokens_per_s": 12988.4,
+          "peak_vram_mb": 861.33
+        }
+      }
+    },
+    {
+      "id": "M_v2_Fixed",
+      "backbone_type": "kvn",
+      "is_v3_architecture": false,
+      "total_iso_compute_epochs": 6,
+      "train_modes": 128,
+      "infer_modes": 128,
+      "trainable_params": 59449857,
+      "active_params_with_lm_head": 63644161,
+      "dynamical_state_bytes_per_seq": 3072,
+      "chunk_boundary_fc_bytes_per_seq": 2048,
+      "total_slot_bytes_per_seq": 5120,
+      "train_wall_time_s": 85.74,
+      "train_loss": 0.7477,
+      "val_loss": 0.703,
+      "val_pos0_shortlist_acc_pct": 19.79,
+      "exact_full_vocab_pos0_acc_pct": 28.02,
+      "val_accept_len_tau": 1.204,
+      "val_greedy_eal": 1.2734,
+      "e2e_linear_T0.0_tau": 1.2078,
+      "e2e_linear_T0.0_exact_greedy_parity": true,
+      "e2e_linear_T0.6_tau": 1.2026,
+      "kraus_tree_specinfer": null,
+      "calibration_15bin_ece": 0.0873,
+      "calibration_rejection_auroc": 0.7469,
+      "dynamic_stopping_pareto": [
+        {
+          "gamma_conf": 0.0,
+          "mean_drafted_tokens": 8.0,
+          "mean_accept_length_tau": 1.4353,
+          "verifier_slot_flops_saved_pct": 0.0
+        },
+        {
+          "gamma_conf": 0.2,
+          "mean_drafted_tokens": 0.5,
+          "mean_accept_length_tau": 1.2328,
+          "verifier_slot_flops_saved_pct": 93.75
+        },
+        {
+          "gamma_conf": 0.35,
+          "mean_drafted_tokens": 0.1897,
+          "mean_accept_length_tau": 1.1422,
+          "verifier_slot_flops_saved_pct": 97.63
+        },
+        {
+          "gamma_conf": 0.5,
+          "mean_drafted_tokens": 0.0991,
+          "mean_accept_length_tau": 1.0862,
+          "verifier_slot_flops_saved_pct": 98.76
+        },
+        {
+          "gamma_conf": 0.65,
+          "mean_drafted_tokens": 0.0517,
+          "mean_accept_length_tau": 1.0474,
+          "verifier_slot_flops_saved_pct": 99.35
+        },
+        {
+          "gamma_conf": 0.8,
+          "mean_drafted_tokens": 0.0172,
+          "mean_accept_length_tau": 1.0172,
+          "verifier_slot_flops_saved_pct": 99.78
+        }
+      ],
+      "proximal_lasso_pruning": null,
+      "batched_drafter_latency_and_vram": {
+        "1": {
+          "step_latency_ms": 34.0444,
+          "draft_tokens_per_s": 235.0,
+          "peak_vram_mb": 727.5
+        },
+        "8": {
+          "step_latency_ms": 32.6939,
+          "draft_tokens_per_s": 1957.6,
+          "peak_vram_mb": 751.63
+        },
+        "32": {
+          "step_latency_ms": 34.2195,
+          "draft_tokens_per_s": 7481.1,
+          "peak_vram_mb": 836.12
+        }
+      }
+    },
+    {
+      "id": "M_v3_Full",
+      "backbone_type": "kvn",
+      "is_v3_architecture": true,
+      "total_iso_compute_epochs": 6,
+      "train_modes": 128,
+      "infer_modes": 128,
+      "trainable_params": 64435332,
+      "active_params_with_lm_head": 68629636,
+      "dynamical_state_bytes_per_seq": 4608,
+      "chunk_boundary_fc_bytes_per_seq": 2048,
+      "total_slot_bytes_per_seq": 6656,
+      "train_wall_time_s": 130.64,
+      "train_loss": 0.7565,
+      "val_loss": 0.6958,
+      "val_pos0_shortlist_acc_pct": 19.01,
+      "exact_full_vocab_pos0_acc_pct": 24.78,
+      "val_accept_len_tau": 1.2215,
+      "val_greedy_eal": 1.276,
+      "e2e_linear_T0.0_tau": 1.1481,
+      "e2e_linear_T0.0_exact_greedy_parity": true,
+      "e2e_linear_T0.6_tau": 1.1847,
+      "kraus_tree_specinfer": {
+        "tree_budget": 9,
+        "branch_width": 2,
+        "greedy_T0.0_tau": 1.2065,
+        "greedy_T0.0_exact_parity": true,
+        "stochastic_T0.6_tau": 1.2603,
+        "delta_tau_vs_linear_T0.0": 0.0583,
+        "delta_tau_vs_linear_T0.6": 0.0756
+      },
+      "calibration_15bin_ece": 0.0824,
+      "calibration_rejection_auroc": 0.7863,
+      "dynamic_stopping_pareto": [
+        {
+          "gamma_conf": 0.0,
+          "mean_drafted_tokens": 8.0,
+          "mean_accept_length_tau": 1.3696,
+          "verifier_slot_flops_saved_pct": 0.0
+        },
+        {
+          "gamma_conf": 0.2,
+          "mean_drafted_tokens": 0.4043,
+          "mean_accept_length_tau": 1.2043,
+          "verifier_slot_flops_saved_pct": 94.95
+        },
+        {
+          "gamma_conf": 0.35,
+          "mean_drafted_tokens": 0.1739,
+          "mean_accept_length_tau": 1.1217,
+          "verifier_slot_flops_saved_pct": 97.83
+        },
+        {
+          "gamma_conf": 0.5,
+          "mean_drafted_tokens": 0.1087,
+          "mean_accept_length_tau": 1.0913,
+          "verifier_slot_flops_saved_pct": 98.64
+        },
+        {
+          "gamma_conf": 0.65,
+          "mean_drafted_tokens": 0.0826,
+          "mean_accept_length_tau": 1.0652,
+          "verifier_slot_flops_saved_pct": 98.97
+        },
+        {
+          "gamma_conf": 0.8,
+          "mean_drafted_tokens": 0.0391,
+          "mean_accept_length_tau": 1.0391,
+          "verifier_slot_flops_saved_pct": 99.51
+        }
+      ],
+      "proximal_lasso_pruning": null,
+      "batched_drafter_latency_and_vram": {
+        "1": {
+          "step_latency_ms": 69.3709,
+          "draft_tokens_per_s": 115.3,
+          "peak_vram_mb": 743.38
+        },
+        "8": {
+          "step_latency_ms": 68.4564,
+          "draft_tokens_per_s": 934.9,
+          "peak_vram_mb": 811.35
+        },
+        "32": {
+          "step_latency_ms": 70.2838,
+          "draft_tokens_per_s": 3642.4,
+          "peak_vram_mb": 1045.1
+        }
+      }
+    },
+    {
+      "id": "M_v3_ProxLASSO_Pruned",
+      "backbone_type": "kvn",
+      "is_v3_architecture": true,
+      "total_iso_compute_epochs": 6,
+      "train_modes": 512,
+      "infer_modes": 128,
+      "trainable_params": 64435332,
+      "active_params_with_lm_head": 68629636,
+      "dynamical_state_bytes_per_seq": 4608,
+      "chunk_boundary_fc_bytes_per_seq": 2048,
+      "total_slot_bytes_per_seq": 6656,
+      "train_wall_time_s": 101.42,
+      "train_loss": 0.7654,
+      "val_loss": 0.7,
+      "val_pos0_shortlist_acc_pct": 19.27,
+      "exact_full_vocab_pos0_acc_pct": 22.98,
+      "val_accept_len_tau": 1.2021,
+      "val_greedy_eal": 1.2578,
+      "e2e_linear_T0.0_tau": 1.1481,
+      "e2e_linear_T0.0_exact_greedy_parity": true,
+      "e2e_linear_T0.6_tau": 1.2065,
+      "kraus_tree_specinfer": {
+        "tree_budget": 9,
+        "branch_width": 2,
+        "greedy_T0.0_tau": 1.2222,
+        "greedy_T0.0_exact_parity": true,
+        "stochastic_T0.6_tau": 1.2267,
+        "delta_tau_vs_linear_T0.0": 0.0741,
+        "delta_tau_vs_linear_T0.6": 0.0202
+      },
+      "calibration_15bin_ece": 0.0572,
+      "calibration_rejection_auroc": 0.7387,
+      "dynamic_stopping_pareto": [
+        {
+          "gamma_conf": 0.0,
+          "mean_drafted_tokens": 8.0,
+          "mean_accept_length_tau": 1.3191,
+          "verifier_slot_flops_saved_pct": 0.0
+        },
+        {
+          "gamma_conf": 0.2,
+          "mean_drafted_tokens": 0.4085,
+          "mean_accept_length_tau": 1.1745,
+          "verifier_slot_flops_saved_pct": 94.89
+        },
+        {
+          "gamma_conf": 0.35,
+          "mean_drafted_tokens": 0.1745,
+          "mean_accept_length_tau": 1.0979,
+          "verifier_slot_flops_saved_pct": 97.82
+        },
+        {
+          "gamma_conf": 0.5,
+          "mean_drafted_tokens": 0.1021,
+          "mean_accept_length_tau": 1.0681,
+          "verifier_slot_flops_saved_pct": 98.72
+        },
+        {
+          "gamma_conf": 0.65,
+          "mean_drafted_tokens": 0.0468,
+          "mean_accept_length_tau": 1.0426,
+          "verifier_slot_flops_saved_pct": 99.41
+        },
+        {
+          "gamma_conf": 0.8,
+          "mean_drafted_tokens": 0.0255,
+          "mean_accept_length_tau": 1.0255,
+          "verifier_slot_flops_saved_pct": 99.68
+        }
+      ],
+      "proximal_lasso_pruning": {
+        "iso_compute_schedule": "5_epochs_prox_lasso_plus_1_epoch_warm_recal",
+        "total_epochs": 6,
+        "kvn_lasso_weight": 0.656,
+        "trainer_logged_zero_dyad_fraction": 0.9727,
+        "pre_prune_zero_dyad_fraction": 0.9727,
+        "active_dyads_before_prune_out_of_256": 7,
+        "unpruned_m512_val_loss": 0.6968,
+        "unpruned_m512_greedy_tau": 1.1481,
+        "zeroshot_layer0_max_abs_drift": 0.0,
+        "zeroshot_greedy_accept_len_tau": 1.1481,
+        "zeroshot_exact_greedy_parity": true
+      },
+      "batched_drafter_latency_and_vram": {
+        "1": {
+          "step_latency_ms": 66.9299,
+          "draft_tokens_per_s": 119.5,
+          "peak_vram_mb": 743.38
+        },
+        "8": {
+          "step_latency_ms": 66.6304,
+          "draft_tokens_per_s": 960.5,
+          "peak_vram_mb": 811.35
+        },
+        "32": {
+          "step_latency_ms": 70.4989,
+          "draft_tokens_per_s": 3631.3,
+          "peak_vram_mb": 1045.1
+        }
+      }
+    }
+  ],
+  "vllm_proposer_and_zero_replay_apc": {
+    "proposer_class": "KvNDSparkVllmProposer",
+    "instantiated": true,
+    "chunked_prefill_32_plus_32_max_abs_err": 0.01486107,
+    "preemption_cpu_swap_restore_max_abs_err": 0.0,
+    "apc_restored_prefix_tokens": 64,
+    "apc_zero_replay_restore_max_abs_err": 0.00422703,
+    "apc_zero_replay_flops": 0,
+    "apc_dynamical_bytes_per_token": 288.0,
+    "apc_total_bytes_per_token_with_last_fc": 416.0,
+    "slot_state_bytes_breakdown": {
+      "recurrent_state_bytes": 4608,
+      "fc_boundary_cache_bytes": 2048,
+      "total_serving_bytes": 6656,
+      "swa_kv_equivalent_bytes": 786432
+    },
+    "propose_chain_len": 0,
+    "propose_kraus_tree_nodes": 16,
+    "pure_attention_tree_kv_compaction_max_abs_err": 6e-07,
+    "amdahl_scheduler_decisions": {
+      "B=1": {
+        "linear_horizon_K": 7,
+        "kraus_tree_budget_N": 24,
+        "predicted_speedup": 3.4555
+      },
+      "B=8": {
+        "linear_horizon_K": 7,
+        "kraus_tree_budget_N": 16,
+        "predicted_speedup": 3.3492
+      },
+      "B=32": {
+        "linear_horizon_K": 2,
+        "kraus_tree_budget_N": 4,
+        "predicted_speedup": 2.3632
+      },
+      "B=64": {
+        "linear_horizon_K": 1,
+        "kraus_tree_budget_N": 0,
+        "predicted_speedup": 1.357
+      }
+    }
+  },
+  "wsl_linux_triton_and_vllm_v1_probe": {
+    "wsl_available": true,
+    "gpu": "NVIDIA GeForce RTX 3070 Ti Laptop GPU",
+    "torch_version": "2.13.0+cu130",
+    "triton_version": "3.7.1",
+    "vllm_version": "0.29.1rc1.dev526+gdb1403ba6.d20260922",
+    "has_triton_kernels": true,
+    "triton_sp4_butterfly_scan_benchmark": {
+      "T=512": {
+        "batch_size": 2,
+        "triton_ms": 5.1988,
+        "pytorch_eager_ms": 8.7313,
+        "triton_speedup_x": 1.679,
+        "max_out_abs_diff": 0.015625,
+        "max_q_fp32_abs_diff": 0.0,
+        "max_p_fp32_abs_diff": 0.0,
+        "max_nu_fp32_abs_diff": 0.0,
+        "all_finite": true
+      },
+      "T=2048": {
+        "batch_size": 2,
+        "triton_ms": 6.0264,
+        "pytorch_eager_ms": 30.3476,
+        "triton_speedup_x": 5.036,
+        "max_out_abs_diff": 0.03125,
+        "max_q_fp32_abs_diff": 0.0,
+        "max_p_fp32_abs_diff": 0.0,
+        "max_nu_fp32_abs_diff": 0.0,
+        "all_finite": true
+      },
+      "T=8192": {
+        "batch_size": 1,
+        "triton_ms": 11.2973,
+        "pytorch_eager_ms": 59.2823,
+        "triton_speedup_x": 5.247,
+        "max_out_abs_diff": 0.03125,
+        "max_q_fp32_abs_diff": 0.0,
+        "max_p_fp32_abs_diff": 0.0,
+        "max_nu_fp32_abs_diff": 0.0,
+        "all_finite": true
+      }
+    },
+    "vllm_v1_plugin_and_proposer_wiring": {
+      "plugin_registered": true,
+      "kvn_dspark_in_vllm_supported_types": true,
+      "has_vllm_custom_class_proposer": false,
+      "resolved_vllm_speculative_config": {
+        "model": "speculators.vllm_integration.kvn_proposer.KvNDSparkVllmProposer",
+        "method": "custom_class",
+        "num_speculative_tokens": 8
+      },
+      "routes_to_proposer_class": true
+    },
+    "pure_attention_tree_kv_compaction_check": {
+      "tree_4d_mask_branch_logit_max_abs_err": 7e-07,
+      "post_compact_kv_next_step_max_abs_err": 7e-07,
+      "passed": true
+    },
+    "live_wsl_e2e_linear_chain": {
+      "mode": "linear_chain",
+      "num_prompts": 4,
+      "max_new_tokens": 24,
+      "mean_accept_len_tau": 1.1899,
+      "mean_propose_latency_ms": 30.3994,
+      "exact_greedy_parity_all_prompts": true,
+      "apc_restored_prefix_tokens": 64,
+      "apc_restore_max_abs_err": 0.0092428,
+      "apc_memory_stats": {
+        "block_size": 16,
+        "cached_blocks": 10,
+        "max_cached_blocks": 4096,
+        "recurrent_bytes_total": 46080,
+        "total_bytes_with_last_fc": 66560,
+        "recurrent_bytes_per_token": 288.0,
+        "total_bytes_per_token": 416.0,
+        "replay_flops_per_hit": 0,
+        "num_lookups": 6,
+        "num_request_hits": 2,
+        "num_block_hits": 5,
+        "saved_prefill_tokens": 80,
+        "num_evictions": 0
+      }
+    },
+    "live_wsl_e2e_kraus_tree_specinfer": {
+      "mode": "kraus_tree_specinfer",
+      "num_prompts": 4,
+      "max_new_tokens": 24,
+      "mean_accept_len_tau": 1.2877,
+      "mean_propose_latency_ms": 47.2467,
+      "exact_greedy_parity_all_prompts": true,
+      "apc_restored_prefix_tokens": 64,
+      "apc_restore_max_abs_err": 0.0092428,
+      "apc_memory_stats": {
+        "block_size": 16,
+        "cached_blocks": 10,
+        "max_cached_blocks": 4096,
+        "recurrent_bytes_total": 46080,
+        "total_bytes_with_last_fc": 66560,
+        "recurrent_bytes_per_token": 288.0,
+        "total_bytes_per_token": 416.0,
+        "replay_flops_per_hit": 0,
+        "num_lookups": 6,
+        "num_request_hits": 2,
+        "num_block_hits": 5,
+        "saved_prefill_tokens": 80,
+        "num_evictions": 0
+      }
+    }
+  }
+}

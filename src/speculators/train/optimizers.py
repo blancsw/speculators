@@ -34,14 +34,23 @@ _ADAMW_NAME_HINTS = (
     "codebook",
     "markov_w1",
     "markov_w2",
+    "prev_embeddings",
     "horizon_",
     "readout_linear",
     "obs_linear",
     "born_proj",
     "omega_rff",
+    "phase_rff",
     "dyad_",
     "layer_mode_",
     "vacuum_",
+    "anchor_proj",
+    "dt_proj",
+    "engram",
+    "squeezing",
+    "butterfly",
+    "lindblad",
+    "kraus",
 )
 
 # Muon only orthogonalizes 2D weight matrices.
@@ -86,6 +95,11 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
     :return: A list of optimizers for the trainer to step in tandem. The default
         "adamw" returns a single optimizer; "muon" returns ``[Muon, AdamW]``.
     """
+    base_model = getattr(model, "module", model)
+    custom_fn = getattr(base_model, "build_custom_optimizers", None)
+    if callable(custom_fn):
+        return custom_fn(config, model=model)
+
     fused = config.optimizer_implementation == "fused"
 
     if config.optimizer == "adamw":

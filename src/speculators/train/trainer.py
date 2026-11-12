@@ -1,3 +1,4 @@
+import contextlib
 import json
 import logging
 import time
@@ -198,6 +199,7 @@ class TrainerConfig(NamedTuple):
     fsdp_replicate_frozen: bool = False
     gradient_checkpointing: bool = False
     max_steps: int | None = None
+    kvn_lasso_weight: float | None = None
 
 
 def _resolve_scheduler_steps(
@@ -355,6 +357,30 @@ class Trainer:
                 root_logger.info(
                     f"Restored best_val_loss={self.best_val_loss:.6f} from checkpoint"
                 )
+
+    def _unwrap_model(self) -> SpeculatorModel:
+        if isinstance(self.model, DistributedDataParallel):
+            return self.model.module  # type: ignore[return-value]
+        return self.model
+
+    def _prepare_forward_train_kwargs(self) -> dict:
+        prep_fn = getattr(self._unwrap_model(), "prepare_train_call_kwargs", None)
+        if callable(prep_fn):
+            return prep_fn(self.config.train_call_kwargs, self.config.kvn_lasso_weight)
+        return dict(self.config.train_call_kwargs or {})
+
+    def _post_optimizer_step(
+        self, loss: torch.Tensor, metrics: dict[str, torch.Tensor]
+    ) -> None:
+        post_fn = getattr(self._unwrap_model(), "post_optimizer_step", None)
+        if callable(post_fn):
+            post_fn(
+                self.optimizers,
+                loss,
+                metrics,
+                self.config.train_call_kwargs,
+                self.config.kvn_lasso_weight,
+            )
 
     def _precast_frozen_linear_weights(self):
         """Store frozen linear weights in the autocast dtype.
@@ -585,6 +611,8 @@ class Trainer:
             if self.config.checkpoint_freq < 1
             else None
         )
+        forward_train_kwargs = self._prepare_forward_train_kwargs()
+
         t_before_fetch = time.perf_counter()
         timer = _StepTimer()
         recovery = BatchRecoveryCoordinator("training")
@@ -621,7 +649,7 @@ class Trainer:
             ):
                 timer.mark("fetch")
                 _draft_tokens, loss, metrics = self.model(
-                    **gpu_batch, **(self.config.train_call_kwargs or {})
+                    **gpu_batch, **forward_train_kwargs
                 )
 
             timer.mark("fwd")
@@ -642,6 +670,7 @@ class Trainer:
 
             timer.mark("bwd")
             self._optimizers_step()
+            self._post_optimizer_step(loss, metrics)
 
             current_lrs = {
                 type(opt).__name__: opt.param_groups[0]["lr"] for opt in self.optimizers
@@ -784,10 +813,8 @@ class Trainer:
                 for old in ckpt_dir.glob(f"epoch{epoch}_*"):
                     if old.is_symlink():
                         old.unlink()
-                try:
+                with contextlib.suppress(OSError):
                     link_name.symlink_to(target)
-                except OSError:
-                    pass
         root_logger.info(f"Checkpoint saved to {self.checkpointer.path / str(epoch)}")
 
     def maybe_update_best(self, epoch: int, val_metrics: dict | None):

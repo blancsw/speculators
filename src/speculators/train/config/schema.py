@@ -328,6 +328,13 @@ class LossArgs(_Group):
         description="Multiplicative loss weight decay applied per TTT step "
         "(1.0 = weight every step equally).",
     )
+    loss_decay: Literal["fixed-exp-decay", "dpace", "deao"] | None = Field(
+        default=None,
+        description="Per-position speculative horizon loss weighting: "
+        "'fixed-exp-decay', 'dpace', or 'deao' (Direct Expected-Acceptance "
+        "Optimization exact survival derivative weights). Alias for "
+        "--per-position-loss-weight.",
+    )
 
     @field_validator("loss_fn")
     @classmethod
@@ -495,10 +502,12 @@ class DFlashArgs(_Group):
     dflash_decay_gamma: float = Field(
         default=4.0, description="Decay gamma for DFlash-family loss weighting."
     )
-    per_position_loss_weight: Literal["fixed-exp-decay", "dpace"] | None = Field(
-        default=None,
-        description="Per-position loss weight option for D-PACE support "
-        "(default: dpace for dflash, fixed-exp-decay otherwise).",
+    per_position_loss_weight: Literal["fixed-exp-decay", "dpace", "deao"] | None = (
+        Field(
+            default=None,
+            description="Per-position loss weight option ('fixed-exp-decay', 'dpace', "
+            "or 'deao'; default: dpace for dflash, fixed-exp-decay otherwise).",
+        )
     )
     dpace_alpha: float = Field(
         default=0.5,
@@ -579,7 +588,7 @@ class KvNDSparkArgs(_Group):
     kvn_reupload_layers: int = Field(
         default=2,
         gt=0,
-        description="KvN-DSpark: number of Barthe Data Re-uploading stages L per layer.",
+        description="KvN-DSpark: Barthe Data Re-uploading stages L per layer.",
     )
     kvn_sigma_g: float = Field(
         default=1.0,
@@ -589,16 +598,16 @@ class KvNDSparkArgs(_Group):
     kvn_lasso_weight: float = Field(
         default=1e-4,
         ge=0.0,
-        description="KvN-DSpark: Barthe Theorem 5.6 LASSO L1 penalty weight on RFF readout.",
+        description="KvN-DSpark: Barthe Thm. 5.6 LASSO weight on RFF readout.",
     )
     kvn_use_born_confidence: bool = Field(
         default=True,
-        description="KvN-DSpark: feed interferometric Born-rule energy into confidence head.",
+        description="KvN-DSpark: feed interferometric Born energy into confidence.",
     )
     kvn_reupload_dim: int = Field(
         default=512,
         ge=0,
-        description="KvN-DSpark: width d_re of ModalDataReuploadingRFF bottleneck (0 = full d_model).",
+        description="KvN-DSpark: ModalDataReuploadingRFF bottleneck width (0 = full).",
     )
     kvn_learnable_rff: bool = Field(
         default=True,
@@ -606,11 +615,11 @@ class KvNDSparkArgs(_Group):
     )
     kvn_enable_interferometer: bool = Field(
         default=True,
-        description="KvN-DSpark: apply O(M) dyadic symplectic beamsplitters before Born detection.",
+        description="KvN-DSpark: apply O(M) dyadic beamsplitters before Born head.",
     )
     kvn_vacuum_born_norm: bool = Field(
         default=True,
-        description="KvN-DSpark: normalize Born energies with Barthe Eq. 4.34 vacuum mode |M+1>.",
+        description="KvN-DSpark: normalize Born energies with Barthe vacuum mode.",
     )
     kvn_anchor_rank: int = Field(
         default=512,
@@ -619,24 +628,81 @@ class KvNDSparkArgs(_Group):
     )
     kvn_multilayer_rollout: bool = Field(
         default=True,
-        description="KvN-DSpark: aggregate modal states across all draft layers in rollout.",
+        description="KvN-DSpark: aggregate modal states across draft layers.",
     )
     kvn_intrablock_mixer: bool = Field(
         default=True,
-        description="KvN-DSpark: attach Zero-KV KxK IntraBlockCausalMixer over speculative horizons.",
+        description="KvN-DSpark: attach Zero-KV KxK IntraBlockCausalMixer.",
     )
     kvn_strict_causal_shift: bool = Field(
         default=True,
-        description="KvN-DSpark: shift fc_output by 1 step with document_ids boundary masking.",
+        description="KvN-DSpark: shift fc_output by 1 step with doc boundary mask.",
     )
     kvn_ffn_mult: float = Field(
         default=1.5,
         gt=0.0,
-        description="KvN-DSpark: FFN hidden dimension multiplier relative to hidden_size.",
+        description="KvN-DSpark: FFN hidden dimension multiplier vs hidden_size.",
     )
     kvn_state_dtype: Literal["bfloat16", "float32"] = Field(
-        default="bfloat16",
-        description="KvN-DSpark: precision of persistent recurrent state buffer at inference.",
+        default="float32",
+        description="KvN-DSpark: recurrent state precision at inference (float32).",
+    )
+    kvn_dyadic_rff: bool = Field(
+        default=True,
+        description="KvN-DSpark v3: dyadic symplectic paired Bosonic RFFs.",
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+    )
+    kvn_use_engram: bool = Field(
+        default=True,
+        description="KvN-DSpark v3: O(1) Zero-KV causal N-gram memory table.",
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+    )
+    kvn_engram_buckets: int = Field(
+        default=65536,
+        gt=0,
+        description="KvN-DSpark v3: number of prime-hashed N-gram Engram buckets.",
+    )
+    kvn_engram_dim: int = Field(
+        default=128,
+        ge=0,
+        description="KvN-DSpark v3: embedding width per Engram N-gram table.",
+    )
+    kvn_symplectic_butterfly: bool = Field(
+        default=True,
+        description="KvN-DSpark v3: symplectic squeezing + butterfly rollout.",
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+    )
+    kvn_squeezing_max_ratio: float = Field(
+        default=0.8,
+        ge=0.0,
+        lt=1.0,
+        description="KvN-DSpark v3: stability bound |s_m| < ratio * eta_m.",
+    )
+    kvn_lindblad_purity: bool = Field(
+        default=True,
+        description="KvN-DSpark v3: Lindblad dephasing purity & entropy observables.",
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+    )
+    kvn_use_kraus_tree: bool = Field(
+        default=True,
+        description="KvN-DSpark v3: low-rank Kraus candidate scoring head.",
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+    )
+    kvn_kraus_top_c: int = Field(
+        default=256,
+        gt=0,
+        description="KvN-DSpark v3: top-C shortlist candidates for Kraus head.",
+    )
+    kvn_self_cond_prob: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="KvN-DSpark v3: scheduled 2-pass self-conditioned rollout prob.",
+    )
+    kvn_use_triton_scan: bool = Field(
+        default=True,
+        description="KvN-DSpark v3: enable fused Triton warp-parallel scan.",
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
     )
 
 
@@ -915,10 +981,13 @@ class TrainConfig(BaseSettings):
             self.optimizer.muon_lr = self.optimizer.lr
         if self.draft.num_layers is None:
             self.draft.num_layers = 5 if is_dflash_family else 1
-        if self.dflash.per_position_loss_weight is None:
-            self.dflash.per_position_loss_weight = (
-                "dpace" if is_dflash else "fixed-exp-decay"
-            )
+        default_weight = "dpace" if is_dflash else "fixed-exp-decay"
+        self.dflash.per_position_loss_weight = (
+            self.loss.loss_decay
+            or self.dflash.per_position_loss_weight
+            or default_weight
+        )
+        self.loss.loss_decay = self.dflash.per_position_loss_weight
         if self.loss.loss_fn is None:
             self.loss.loss_fn = _DEFAULT_LOSS_FN.get(self.speculator_type, "kl_div")
         if self.dflash.block_size is None:
@@ -939,6 +1008,13 @@ class TrainConfig(BaseSettings):
                 raise ValueError(
                     f"--dpace-alpha must be in (0, 1], got {self.dflash.dpace_alpha}"
                 )
+        if (
+            self.dflash.per_position_loss_weight == "deao"
+            and self.speculator_type != "kvn_dspark"
+        ):
+            raise ValueError(
+                "--loss-decay=deao is only supported for --speculator-type=kvn_dspark"
+            )
         return self
 
     @model_validator(mode="after")

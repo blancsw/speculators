@@ -1,13 +1,14 @@
 import asyncio
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows compatibility
-    fcntl = None  # type: ignore[assignment]
 import functools
 import logging
 import os
 import time
 from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows compatibility
+    fcntl = None  # type: ignore[assignment]
 
 import openai
 from openai.types.chat import ChatCompletion, ChatCompletionMessageParam

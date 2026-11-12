@@ -1,5 +1,7 @@
 """Unit tests for KvN-DSpark (Zero-KV-Cache Koopman-von Neumann RFF Speculator)."""
 
+# ruff: noqa: PT018
+
 import pytest
 import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -7,7 +9,6 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from speculators.config import SpeculatorsConfig, VerifierConfig
 from speculators.model import SpeculatorModel
 from speculators.models.kvn_dspark import (
-    BornConfidenceHead,
     CausalKvNRFFLayer,
     KvNDSparkDraftModel,
     KvNDSparkSpeculatorConfig,
@@ -19,7 +20,9 @@ from speculators.train.config.schema import TrainConfig
 from speculators.train.optimizers import split_named_params_for_muon
 
 
-def _make_qwen3_tl_config(hidden_size: int = 64, num_layers: int = 3, vocab_size: int = 128) -> Qwen3Config:
+def _make_qwen3_tl_config(
+    hidden_size: int = 64, num_layers: int = 3, vocab_size: int = 128
+) -> Qwen3Config:
     return Qwen3Config(
         vocab_size=vocab_size,
         hidden_size=hidden_size,
@@ -46,7 +49,9 @@ def _make_kvn_config(
     num_layers: int = 3,
     vocab_size: int = 128,
 ) -> KvNDSparkSpeculatorConfig:
-    tl_cfg = _make_qwen3_tl_config(hidden_size=hidden_size, num_layers=num_layers, vocab_size=vocab_size)
+    tl_cfg = _make_qwen3_tl_config(
+        hidden_size=hidden_size, num_layers=num_layers, vocab_size=vocab_size
+    )
     return KvNDSparkSpeculatorConfig(
         transformer_layer_config=tl_cfg,
         draft_vocab_size=vocab_size,
@@ -68,7 +73,9 @@ def _make_kvn_config(
             algorithm="kvn_dspark",
             proposal_methods=[GreedyTokenProposalConfig(speculative_tokens=block_size)],
             default_proposal_method="greedy",
-            verifier=VerifierConfig(name_or_path=None, architectures=["Qwen3ForCausalLM"]),
+            verifier=VerifierConfig(
+                name_or_path=None, architectures=["Qwen3ForCausalLM"]
+            ),
         ),
     )
 
@@ -132,13 +139,13 @@ def test_multi_horizon_koopman_rollout_and_muon_routing():
     assert hidden_blocks.shape == (5, 4, 64)
     assert born_features.shape == (5, 4, 32)
 
-    muon_params, adamw_params = split_named_params_for_muon(rollout)
-    muon_names = {n for n, _ in muon_params}
+    _, adamw_params = split_named_params_for_muon(rollout)
     adamw_names = {n for n, _ in adamw_params}
     assert "horizon_freq_scale" in adamw_names
     assert "horizon_log_decay" in adamw_names
     assert "horizon_phase_bias" in adamw_names
-    assert "anchor_proj.weight" in muon_names
+    assert "anchor_proj.weight" in adamw_names
+    assert "obs_linear.weight" in adamw_names
 
 
 @pytest.mark.parametrize("backbone_type", ["kvn", "hybrid_1swa_2kvn", "swa"])
@@ -175,7 +182,10 @@ def test_kvn_dspark_draft_model_forward_backward_and_pruning(backbone_type: str)
 
     if backbone_type == "kvn":
         swa_cfg = _make_kvn_config(backbone_type="swa", n_modes=32)
-        assert cfg.estimated_state_bytes_per_seq() < swa_cfg.estimated_state_bytes_per_seq() * 0.1
+        assert (
+            cfg.estimated_state_bytes_per_seq()
+            < swa_cfg.estimated_state_bytes_per_seq() * 0.1
+        )
         model.prune_kvn_modes(16)
         assert model.config.kvn_n_modes == 16
         _, loss_after, _ = model(
@@ -190,7 +200,7 @@ def test_kvn_dspark_draft_model_forward_backward_and_pruning(backbone_type: str)
 
 
 def test_strict_causality_no_future_leakage():
-    """Verify that modifying tokens t > t0 has zero effect on outputs/states at t <= t0."""
+    """Verify modifying tokens t > t0 has zero effect on outputs/states at t <= t0."""
     torch.manual_seed(123)
     layer = CausalKvNRFFLayer(d_model=64, n_modes=32, reupload_layers_l=2)
     layer.eval()
@@ -211,7 +221,7 @@ def test_strict_causality_no_future_leakage():
 
 
 def test_fft_equals_recurrent_step_o1_state():
-    """Verify parallel O(T log T) FFT dynamics match O(1) step-by-step recurrent inference."""
+    """Verify parallel O(T log T) FFT dynamics match O(1) recurrent inference."""
     torch.manual_seed(99)
     layer = CausalKvNRFFLayer(d_model=64, n_modes=32, reupload_layers_l=2)
     layer.eval()
@@ -240,20 +250,25 @@ def test_fft_equals_recurrent_step_o1_state():
 
 
 def test_exact_pruning_invariance_when_inactive_modes_zero():
-    """Verify Barthe LASSO pruning theorem: zero-weight inactive modes prune with zero error."""
+    """Verify Barthe LASSO pruning theorem: zero-weight inactive modes prune with zero
+    error.
+    """
     torch.manual_seed(314)
     cfg = _make_kvn_config(backbone_type="kvn", n_modes=32, block_size=4, num_layers=2)
     model = KvNDSparkDraftModel(cfg)
     _init_dummy_verifier_weights(model)
     model.eval()
 
-    # Zero out readout columns for modes 16..31 across all layers, rollout, and born_proj
+    # Zero out readout/head columns for modes 16..31 across all layers, rollout, Born,
+    # and Kraus heads
     with torch.no_grad():
         for layer in model.kvn_layers:
             m = layer.n_modes
             layer.readout_linear.weight[:, 16:m] = 0.0
             layer.readout_linear.weight[:, m + 16 : 2 * m] = 0.0
             layer.readout_linear.weight[:, 2 * m + 16 : 3 * m] = 0.0
+            if layer.butterfly_couple_gate is not None:
+                layer.butterfly_couple_gate[16:m] = 0.0
         assert model.rollout is not None
         m = model.rollout.n_modes
         model.rollout.obs_linear.weight[:, 16:m] = 0.0
@@ -262,14 +277,22 @@ def test_exact_pruning_invariance_when_inactive_modes_zero():
         assert model.born_confidence_head is not None
         assert model.born_confidence_head.born_proj is not None
         model.born_confidence_head.born_proj.weight[:, 16:m] = 0.0
+        if model.born_confidence_head.vacuum_pvac_proj is not None:
+            model.born_confidence_head.vacuum_pvac_proj.weight[:, 8 : m // 2] = 0.0
+        if model.born_confidence_head.lindblad_purity_proj is not None:
+            model.born_confidence_head.lindblad_purity_proj.weight[:, 16:m] = 0.0
+        if model.kraus_head is not None:
+            model.kraus_head.kraus_mode_gate[16:m] = 0.0
+            model.kraus_head.kraus_backaction_proj.weight[:, 16:m] = 0.0
+            model.kraus_head.kraus_backaction_proj.weight[:, m + 16 : 2 * m] = 0.0
 
     seq_len = 24
     hidden_states = torch.randn(1, seq_len, 3 * 64)
     input_ids = torch.randint(0, 128, (1, seq_len))
     loss_mask = torch.zeros(1, seq_len, dtype=torch.bool)
-    # Fix exactly 2 deterministic anchors at positions 4 and 10
-    loss_mask[0, 4] = True
-    loss_mask[0, 10] = True
+    # Fix exactly 2 deterministic anchors at positions 4 and 10 (predicting 5 and 11)
+    loss_mask[0, 5] = True
+    loss_mask[0, 11] = True
     verifier_last_hs = torch.randn(1, seq_len, 64)
     document_ids = torch.zeros(1, seq_len, dtype=torch.long)
 
@@ -333,14 +356,18 @@ def test_save_and_reload_pruned_checkpoint(tmp_path):
 
 
 def test_torch_dynamo_eager_compile():
-    """Verify torch._dynamo traces KvNDSparkDraftModel.forward cleanly for Linux H200."""
+    """Verify torch._dynamo traces KvNDSparkDraftModel.forward cleanly for H200."""
     torch.manual_seed(77)
     cfg = _make_kvn_config(backbone_type="kvn", n_modes=16, block_size=4, num_layers=2)
     model = KvNDSparkDraftModel(cfg)
     _init_dummy_verifier_weights(model)
 
-    raw_fn = getattr(KvNDSparkDraftModel.forward, "__wrapped__", KvNDSparkDraftModel.forward)
-    compiled_fn = torch.compile(raw_fn.__get__(model, KvNDSparkDraftModel), backend="eager")
+    raw_fn = getattr(
+        KvNDSparkDraftModel.forward, "__wrapped__", KvNDSparkDraftModel.forward
+    )
+    compiled_fn = torch.compile(
+        raw_fn.__get__(model, KvNDSparkDraftModel), backend="eager"
+    )
     seq_len = 24
     hidden_states = torch.randn(1, seq_len, 3 * 64)
     input_ids = torch.randint(0, 128, (1, seq_len))
