@@ -363,6 +363,88 @@ def _patch_engine_args_cls(engine_args_cls: type[Any]) -> None:
     _PATCHED_CLASSES.add(engine_args_cls)
 
 
+def _is_kvn_spec_config(spec_cfg: Any) -> bool:
+    """Return whether ``spec_cfg`` targets ``KvNDSparkVllmProposer``."""
+    if spec_cfg is None:
+        return False
+    if getattr(spec_cfg, "model", None) == PROPOSER_IMPORT_PATH:
+        return True
+    if getattr(spec_cfg, "kvn_checkpoint_path", None) is not None:
+        return True
+    if PROPOSER_IMPORT_PATH in repr(getattr(spec_cfg, "__dict__", {})):
+        return True
+    return getattr(spec_cfg, "method", None) == "custom_class" and bool(
+        os.environ.get("KVN_DSPARK_CHECKPOINT_PATH")
+    )
+
+
+def _can_enable_kvn_async_sched(vllm_cfg: Any) -> bool:
+    """Verify executor, runner, and PP compatibility for ``async_scheduling=True``."""
+    model_cfg = getattr(vllm_cfg, "model_config", None)
+    if model_cfg is not None and getattr(model_cfg, "runner_type", None) == "pooling":
+        return False
+    par_cfg = getattr(vllm_cfg, "parallel_config", None)
+    if (
+        par_cfg is not None
+        and int(getattr(par_cfg, "pipeline_parallel_size", 1)) > 1
+        and not bool(getattr(vllm_cfg, "use_v2_model_runner", False))
+    ):
+        return False
+    try:
+        exec_mod = importlib.import_module("vllm.v1.executor.abstract")
+        exec_cls = exec_mod.Executor.get_class(vllm_cfg)
+        return bool(exec_cls.supports_async_scheduling())
+    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+        return True
+
+
+def _patch_vllm_config_cls(vllm_cfg_cls: type[Any]) -> None:
+    """Enable ``async_scheduling=True`` on ``VllmConfig`` for KvN proposer."""
+    if vllm_cfg_cls in _PATCHED_CLASSES:
+        return
+    orig_post_init = getattr(vllm_cfg_cls, "__post_init__", None)
+    if not callable(orig_post_init):
+        return
+
+    @functools.wraps(orig_post_init)
+    def _wrapped_vllm_post_init(self: Any) -> None:
+        sched_cfg = getattr(self, "scheduler_config", None)
+        spec_cfg = getattr(self, "speculative_config", None)
+        orig_async = (
+            getattr(sched_cfg, "async_scheduling", None)
+            if sched_cfg is not None
+            else False
+        )
+        want_kvn_async = (
+            sched_cfg is not None
+            and _is_kvn_spec_config(spec_cfg)
+            and os.environ.get("KVN_VLLM_DISABLE_ASYNC_SCHED", "0").strip() != "1"
+            and not bool(getattr(spec_cfg, "disable_padded_drafter_batch", False))
+            and orig_async in (None, True)
+        )
+        if want_kvn_async:
+            sched_cfg.async_scheduling = False
+        orig_post_init(self)
+        if want_kvn_async and _can_enable_kvn_async_sched(self):
+            sched_cfg.async_scheduling = True
+            par_cfg = getattr(self, "parallel_config", None)
+            if par_cfg is not None and hasattr(
+                par_cfg, "disable_nccl_for_dp_synchronization"
+            ):
+                par_cfg.disable_nccl_for_dp_synchronization = True
+
+    vllm_cfg_cls.__post_init__ = _wrapped_vllm_post_init  # type: ignore[method-assign]
+    _PATCHED_CLASSES.add(vllm_cfg_cls)
+
+
+def _patch_vllm_config_async_sched() -> None:
+    """Patch ``vllm.config.vllm.VllmConfig`` to allow async KvN GPU drafting."""
+    vllm_mod = importlib.import_module("vllm.config.vllm")
+    vllm_cfg_cls = getattr(vllm_mod, "VllmConfig", None)
+    if vllm_cfg_cls is not None:
+        _patch_vllm_config_cls(vllm_cfg_cls)
+
+
 def _patch_speculative_config_and_engine_args() -> None:
     """Patch ``SpeculativeConfig`` and ``EngineArgs.create_speculative_config``."""
     spec_mod = importlib.import_module("vllm.config.speculative")
@@ -407,6 +489,52 @@ def _patch_runner_aux_layers_hook(runner_cls: type[Any]) -> None:
     setattr(runner_cls, attr_name, _wrapped_get_eagle3_aux_layers)
 
 
+def _patch_runner_bookkeeping_hook(runner_cls: type[Any]) -> None:
+    """Prepare async GPU sampled counts before ``_bookkeeping_sync`` asserts."""
+    orig_bookkeeping = getattr(runner_cls, "_bookkeeping_sync", None)
+    if not callable(orig_bookkeeping):
+        return
+
+    @functools.wraps(orig_bookkeeping)
+    def _wrapped_bookkeeping_sync(
+        self: Any,
+        scheduler_output: Any,
+        sampler_output: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        drafter = getattr(self, "drafter", None)
+        if (
+            _is_kvn_proposer(drafter)
+            and bool(getattr(self, "use_async_scheduling", False))
+            and getattr(self, "speculative_config", None) is not None
+            and sampler_output is not None
+        ):
+            sampled_gpu = getattr(sampler_output, "sampled_token_ids", None)
+            req_ids = getattr(getattr(self, "input_batch", None), "req_ids", ())
+            if sampled_gpu is not None and len(req_ids) > 0:
+                if getattr(self, "valid_sampled_token_count_gpu", None) is None:
+                    next_tok_ids, valid_counts = drafter.prepare_async_sampled_tokens(
+                        self, sampled_gpu
+                    )
+                    self._copy_valid_sampled_token_count(next_tok_ids, valid_counts)
+                else:
+                    next_tok_ids = self.input_batch.prev_sampled_token_ids.squeeze(1)
+                    valid_counts = self.valid_sampled_token_count_gpu
+                drafter._async_step_tensors = (  # noqa: SLF001
+                    sampled_gpu,
+                    next_tok_ids,
+                    valid_counts,
+                )
+            else:
+                drafter._async_step_tensors = None  # noqa: SLF001
+        return orig_bookkeeping(
+            self, scheduler_output, sampler_output, *args, **kwargs
+        )
+
+    runner_cls._bookkeeping_sync = _wrapped_bookkeeping_sync  # noqa: SLF001
+
+
 def _patch_runner_propose_hook(runner_cls: type[Any]) -> None:
     """Route ``GPUModelRunner.propose_draft_token_ids`` to ``KvNDSparkVllmProposer``."""
     orig_propose = getattr(runner_cls, "propose_draft_token_ids", None)
@@ -428,12 +556,62 @@ def _patch_runner_propose_hook(runner_cls: type[Any]) -> None:
     ) -> Any:
         drafter = getattr(self, "drafter", None)
         if _is_kvn_proposer(drafter):
-            return drafter.propose_vllm_step(
-                runner=self,
-                scheduler_output=scheduler_output,
-                sampled_token_ids=sampled_token_ids,
-                aux_hidden_states=aux_hidden_states,
-            )
+            drafter._current_sampling_metadata = sampling_metadata  # noqa: SLF001
+            drafter._current_spec_decode_metadata = spec_decode_metadata  # noqa: SLF001
+            try:
+                if bool(getattr(self, "use_async_scheduling", False)):
+                    req_ids = list(
+                        getattr(getattr(self, "input_batch", None), "req_ids", ())
+                    )
+                    async_pack = getattr(drafter, "_async_step_tensors", None)
+                    drafter._async_step_tensors = None  # noqa: SLF001
+                    if async_pack is not None:
+                        sampled_gpu, next_tok_gpu, valid_counts_gpu = async_pack
+                        self._draft_token_req_ids = req_ids
+                        return drafter.propose_vllm_async_gpu_step(
+                            runner=self,
+                            scheduler_output=scheduler_output,
+                            sampled_token_ids_gpu=sampled_gpu,
+                            next_token_ids_gpu=next_tok_gpu,
+                            valid_counts_gpu=valid_counts_gpu,
+                            aux_hidden_states=aux_hidden_states,
+                            sampling_metadata=sampling_metadata,
+                        )
+                    if hasattr(sampled_token_ids, "shape"):
+                        if len(req_ids) == 0:
+                            self._draft_token_req_ids = []
+                            return sampled_token_ids.new_zeros(
+                                (0, 0), dtype=sampled_token_ids.dtype
+                            )
+                        next_tok_gpu, valid_counts_gpu = (
+                            drafter.prepare_async_sampled_tokens(
+                                self, sampled_token_ids
+                            )
+                        )
+                        if hasattr(self, "_copy_valid_sampled_token_count"):
+                            self._copy_valid_sampled_token_count(
+                                next_tok_gpu, valid_counts_gpu
+                            )
+                        self._draft_token_req_ids = req_ids
+                        return drafter.propose_vllm_async_gpu_step(
+                            runner=self,
+                            scheduler_output=scheduler_output,
+                            sampled_token_ids_gpu=sampled_token_ids,
+                            next_token_ids_gpu=next_tok_gpu,
+                            valid_counts_gpu=valid_counts_gpu,
+                            aux_hidden_states=aux_hidden_states,
+                            sampling_metadata=sampling_metadata,
+                        )
+                return drafter.propose_vllm_step(
+                    runner=self,
+                    scheduler_output=scheduler_output,
+                    sampled_token_ids=sampled_token_ids,
+                    aux_hidden_states=aux_hidden_states,
+                    sampling_metadata=sampling_metadata,
+                )
+            finally:
+                drafter._current_sampling_metadata = None  # noqa: SLF001
+                drafter._current_spec_decode_metadata = None  # noqa: SLF001
         return orig_propose(
             self,
             scheduler_output,
@@ -482,6 +660,7 @@ def _patch_gpu_model_runner() -> None:
     runner_cls.__init__ = _wrapped_init  # type: ignore[method-assign]
     runner_cls.load_model = _wrapped_load_model
     _patch_runner_aux_layers_hook(runner_cls)
+    _patch_runner_bookkeeping_hook(runner_cls)
     _patch_runner_propose_hook(runner_cls)
     _PATCHED_CLASSES.add(runner_cls)
 
@@ -501,6 +680,7 @@ def register_kvn_vllm_plugin() -> bool:
     for patch_fn, label in (
         (_patch_speculators_algos_and_base, "speculators.algos/base"),
         (_patch_speculative_config_and_engine_args, "SpeculativeConfig/EngineArgs"),
+        (_patch_vllm_config_async_sched, "VllmConfig.async_scheduling"),
         (_patch_gpu_model_runner, "GPUModelRunner"),
     ):
         try:

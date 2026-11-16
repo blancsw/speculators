@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
 _RANK_2D = 2
 _NU_MIN_COMPONENTS = 3
+_CUDAGRAPH_SCRATCH_SLOTS = 128
 
 __all__ = [
     "APCBlockSnapshot",
@@ -56,6 +57,7 @@ class APCBlockSnapshot:
     p_state: Tensor  # [num_layers, n_modes]
     last_fc: Tensor  # [d_model]
     nu_state: Tensor | None = None  # [num_layers, n_modes]
+    last2_tokens: tuple[int, int] = (0, 0)
 
     def recurrent_bytes(self) -> int:
         """Return byte size of recurrent Bosonic state (q, p, [nu]) in this snapshot."""
@@ -83,6 +85,8 @@ class PreemptedRequestState:
     p_state: Tensor
     last_fc: Tensor
     nu_state: Tensor | None = None
+    last2_tokens: tuple[int, int] = (0, 0)
+    prompt_committed: bool = False
 
 
 def _hash_token_block(
@@ -163,7 +167,8 @@ class KvNStateSlotPool:
         self.fc_dtype = fc_dtype
         self.device = torch.device(device)
 
-        shape = (self.max_num_seqs, self.num_layers, self.n_modes)
+        self._pool_rows = self.max_num_seqs + _CUDAGRAPH_SCRATCH_SLOTS
+        shape = (self._pool_rows, self.num_layers, self.n_modes)
         self.q_pool = torch.zeros(shape, dtype=self.state_dtype, device=self.device)
         self.p_pool = torch.zeros(shape, dtype=self.state_dtype, device=self.device)
         self.nu_pool: Tensor | None = (
@@ -172,20 +177,55 @@ class KvNStateSlotPool:
             else None
         )
         self.last_fc_pool = torch.zeros(
-            (self.max_num_seqs, self.d_model),
+            (self._pool_rows, self.d_model),
             dtype=self.fc_dtype,
             device=self.device,
         )
-        self.has_last_fc = torch.zeros(
-            (self.max_num_seqs,), dtype=torch.bool, device=self.device
+        self.last2_tokens_pool = torch.zeros(
+            (self._pool_rows, 2),
+            dtype=torch.int64,
+            device=self.device,
         )
-        self.seq_lens = torch.zeros(
-            (self.max_num_seqs,), dtype=torch.int64, device=self.device
+        # Keep scalar metadata on CPU to avoid per-request CUDA stream syncs (.item()).
+        self.has_last_fc = torch.zeros(
+            (self._pool_rows,), dtype=torch.bool, device="cpu"
+        )
+        self.seq_lens = torch.zeros((self._pool_rows,), dtype=torch.int64, device="cpu")
+        self.prompt_committed = torch.zeros(
+            (self._pool_rows,), dtype=torch.bool, device="cpu"
         )
 
         self._req_to_slot: dict[str, int] = {}
         self._free_slots: list[int] = list(range(self.max_num_seqs - 1, -1, -1))
         self._preempted: dict[str, PreemptedRequestState] = {}
+
+    @property
+    def scratch_slot_base(self) -> int:
+        """First dedicated scratch slot index reserved for CUDA-Graph batch padding."""
+        return self.max_num_seqs
+
+    def get_seq_len(self, slot_idx: int) -> int:
+        """Return committed sequence length for ``slot_idx`` with zero GPU sync."""
+        return int(self.seq_lens[slot_idx].item())
+
+    def get_has_last_fc(self, slot_idx: int) -> bool:
+        """Return whether ``last_fc_pool[slot_idx]`` holds valid boundary state."""
+        return bool(self.has_last_fc[slot_idx].item())
+
+    def set_slot_meta(
+        self, slot_idx: int, *, seq_len: int, has_last_fc: bool
+    ) -> None:
+        """Update CPU-resident sequence length and ``has_last_fc`` flag in O(1)."""
+        self.seq_lens[slot_idx] = int(seq_len)
+        self.has_last_fc[slot_idx] = bool(has_last_fc)
+
+    def is_prompt_committed(self, slot_idx: int) -> bool:
+        """Return whether ``slot_idx`` has completed prompt commitment."""
+        return bool(self.prompt_committed[slot_idx].item())
+
+    def set_prompt_committed(self, slot_idx: int, committed: bool = True) -> None:
+        """Mark whether ``slot_idx`` has completed prompt commitment."""
+        self.prompt_committed[slot_idx] = bool(committed)
 
     @property
     def num_active_requests(self) -> int:
@@ -236,8 +276,10 @@ class KvNStateSlotPool:
         if self.nu_pool is not None:
             self.nu_pool[slot_idx].zero_()
         self.last_fc_pool[slot_idx].zero_()
+        self.last2_tokens_pool[slot_idx].zero_()
         self.has_last_fc[slot_idx] = False
         self.seq_lens[slot_idx] = 0
+        self.prompt_committed[slot_idx] = False
 
     def get_or_allocate_slot(self, req_id: str) -> tuple[int, bool]:
         """Return ``(slot_idx, is_new_allocation)``, auto-restoring preempted state."""
@@ -262,8 +304,14 @@ class KvNStateSlotPool:
             self.last_fc_pool[slot_idx].copy_(
                 saved.last_fc.to(self.device, self.fc_dtype)
             )
+            self.last2_tokens_pool[slot_idx].copy_(
+                torch.tensor(
+                    saved.last2_tokens, dtype=torch.int64, device=self.device
+                )
+            )
             self.has_last_fc[slot_idx] = saved.has_last_fc
             self.seq_lens[slot_idx] = saved.seq_len
+            self.prompt_committed[slot_idx] = saved.prompt_committed
             return slot_idx, False
 
         self.reset_slot(slot_idx)
@@ -274,6 +322,7 @@ class KvNStateSlotPool:
         if req_id not in self._req_to_slot:
             return
         slot_idx = self._req_to_slot.pop(req_id)
+        t2 = self.last2_tokens_pool[slot_idx].detach().cpu().tolist()
         self._preempted[req_id] = PreemptedRequestState(
             req_id=req_id,
             seq_len=int(self.seq_lens[slot_idx].item()),
@@ -286,6 +335,8 @@ class KvNStateSlotPool:
                 if self.nu_pool is not None
                 else None
             ),
+            last2_tokens=(int(t2[0]), int(t2[1])),
+            prompt_committed=bool(self.prompt_committed[slot_idx].item()),
         )
         self.reset_slot(slot_idx)
         self._free_slots.append(slot_idx)
@@ -297,6 +348,19 @@ class KvNStateSlotPool:
             slot_idx = self._req_to_slot.pop(req_id)
             self.reset_slot(slot_idx)
             self._free_slots.append(slot_idx)
+
+    def get_preempted_state(self, req_id: str) -> PreemptedRequestState | None:
+        """Return saved preempted state for ``req_id`` if present."""
+        return self._preempted.get(req_id)
+
+    def evict_excess_preempted(self, max_saved: int) -> list[str]:
+        """FIFO-evict preempted entries beyond ``max_saved`` and return evicted IDs."""
+        evicted: list[str] = []
+        while len(self._preempted) > max_saved:
+            oldest_rid = next(iter(self._preempted))
+            self._preempted.pop(oldest_rid, None)
+            evicted.append(oldest_rid)
+        return evicted
 
     def build_causal_shifted_fc(
         self,
@@ -335,6 +399,8 @@ class KvNStateSlotPool:
         last_fc: Tensor,
         tokens_advanced: int,
         nu_state: Tensor | None = None,
+        *,
+        last2_tokens: tuple[int, int] = (0, 0),
     ) -> None:
         """Commit updated recurrent state and boundary ``last_fc`` into ``slot_idx``."""
         self.q_pool[slot_idx].copy_(q_state.to(self.device, self.state_dtype))
@@ -347,8 +413,26 @@ class KvNStateSlotPool:
         self.last_fc_pool[slot_idx].copy_(
             last_fc.reshape(self.d_model).to(self.device, self.fc_dtype)
         )
+        if last2_tokens != (0, 0):
+            self.last2_tokens_pool[slot_idx].copy_(
+                torch.tensor(last2_tokens, dtype=torch.int64, device=self.device)
+            )
         self.has_last_fc[slot_idx] = True
         self.seq_lens[slot_idx] += int(tokens_advanced)
+
+    def advance_slot_last2_tokens(
+        self, slot_idx: int, new_tokens: Sequence[int]
+    ) -> None:
+        """Update ``last2_tokens_pool[slot_idx]`` after advancing ``new_tokens``."""
+        n_new = len(new_tokens)
+        if n_new >= _RANK_2D:
+            pair = (int(new_tokens[-2]), int(new_tokens[-1]))
+            self.last2_tokens_pool[slot_idx].copy_(
+                torch.tensor(pair, dtype=torch.int64, device=self.device)
+            )
+        elif n_new == 1:
+            self.last2_tokens_pool[slot_idx, 0] = self.last2_tokens_pool[slot_idx, 1]
+            self.last2_tokens_pool[slot_idx, 1] = int(new_tokens[0])
 
     def gather_drafter_state_cache(
         self,
@@ -425,6 +509,40 @@ class KvNStateSlotPool:
         if self.nu_pool is not None and nu_new is not None:
             self.nu_pool.index_copy_(0, idx, nu_new)
 
+    def gather_into_state_buffer(
+        self,
+        slot_idx_buf: Tensor,
+        out_state_buf: Tensor,
+    ) -> None:
+        """Zero-allocation CUDA-Graph-safe gather into ``[L, C, B, M]`` buffer."""
+        q_b = self.q_pool.index_select(0, slot_idx_buf).permute(1, 0, 2)
+        p_b = self.p_pool.index_select(0, slot_idx_buf).permute(1, 0, 2)
+        out_state_buf[:, 0].copy_(q_b)
+        out_state_buf[:, 1].copy_(p_b)
+        if out_state_buf.size(1) >= _NU_MIN_COMPONENTS:
+            if self.nu_pool is not None:
+                nu_b = self.nu_pool.index_select(0, slot_idx_buf).permute(1, 0, 2)
+                out_state_buf[:, 2].copy_(nu_b)
+            else:
+                out_state_buf[:, 2].zero_()
+
+    def scatter_from_state_buffer(
+        self,
+        slot_idx_buf: Tensor,
+        in_state_buf: Tensor | tuple[Tensor, ...] | dict[str, Tensor],
+    ) -> None:
+        """Zero-allocation CUDA-Graph-safe scatter from ``[L, C, B, M]`` buffer."""
+        if isinstance(in_state_buf, Tensor):
+            q_new = in_state_buf[:, 0].permute(1, 0, 2).to(self.state_dtype)
+            p_new = in_state_buf[:, 1].permute(1, 0, 2).to(self.state_dtype)
+            self.q_pool.index_copy_(0, slot_idx_buf, q_new)
+            self.p_pool.index_copy_(0, slot_idx_buf, p_new)
+            if self.nu_pool is not None and in_state_buf.size(1) >= _NU_MIN_COMPONENTS:
+                nu_new = in_state_buf[:, 2].permute(1, 0, 2).to(self.state_dtype)
+                self.nu_pool.index_copy_(0, slot_idx_buf, nu_new)
+            return
+        self.scatter_drafter_state_cache(slot_idx_buf, in_state_buf)
+
     def bytes_per_seq(self, include_last_fc: bool = True) -> int:
         """Compute exact persistent GPU state bytes per active sequence."""
         state_elem = torch.empty((), dtype=self.state_dtype).element_size()
@@ -484,6 +602,7 @@ class ZeroReplayAPCStateCache:
         p_state: Tensor,
         last_fc: Tensor,
         nu_state: Tensor | None = None,
+        last2_tokens: tuple[int, int] = (0, 0),
     ) -> APCBlockSnapshot:
         """Insert or refresh an LRU 16-token boundary snapshot."""
         if block_hash in self._blocks:
@@ -506,6 +625,7 @@ class ZeroReplayAPCStateCache:
                 if nu_state is not None
                 else None
             ),
+            last2_tokens=(int(last2_tokens[0]), int(last2_tokens[1])),
         )
         self._blocks[block_hash] = snap
         return snap
@@ -546,6 +666,8 @@ class ZeroReplayAPCStateCache:
         for b_idx, b_hash in enumerate(hashes):
             local_end_idx = (b_idx + 1) * self.block_size - 1
             global_end = start_offset + local_end_idx + 1
+            p0 = int(toks[local_end_idx - 1]) if local_end_idx >= 1 else 0
+            p1 = int(toks[local_end_idx])
             self.store_block_snapshot(
                 block_hash=b_hash,
                 parent_hash=parent,
@@ -558,6 +680,7 @@ class ZeroReplayAPCStateCache:
                     if nu_per_step is not None
                     else None
                 ),
+                last2_tokens=(p0, p1),
             )
             parent = b_hash
         return hashes
@@ -626,6 +749,7 @@ class ZeroReplayAPCStateCache:
             last_fc=last_snap.last_fc,
             tokens_advanced=restored_tokens,
             nu_state=last_snap.nu_state,
+            last2_tokens=last_snap.last2_tokens,
         )
         self.num_block_hits += hit_blocks
         self.num_request_hits += 1

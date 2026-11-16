@@ -57,6 +57,22 @@ _LAYER_OUT_V3_LEN = 5
 _STEP_STATE_V3_LEN = 3
 _ADVANCE_V3_RETURN_LEN = 3
 _PROB_EPS = 1e-12
+_MIN_TEMP_EPS = 1e-5
+_PREV2_MIN_POS = 2
+_CUDAGRAPH_BATCH_BUCKETS: tuple[int, ...] = (
+    1,
+    2,
+    4,
+    8,
+    16,
+    24,
+    32,
+    48,
+    64,
+    96,
+    128,
+)
+_MAX_CUDAGRAPH_BATCH = 128
 
 logger = logging.getLogger(__name__)
 
@@ -570,11 +586,43 @@ class KvNDSparkVllmProposer:
         self.enable_apc = bool(enable_apc)
         self.apc_block_size = int(apc_block_size)
         self.apc_max_blocks = int(apc_max_blocks)
-        self.use_kraus_tree = bool(use_kraus_tree)
+        env_tree = os.environ.get("KVN_VLLM_USE_KRAUS_TREE", "").strip() == "1"
+        self.use_kraus_tree = bool(use_kraus_tree or env_tree)
         self.tree_budget = int(tree_budget)
         self.branch_width = int(branch_width)
         self._custom_scheduler = scheduler
         self._roofline = roofline
+        self._current_sampling_metadata: Any = None
+        self._current_spec_decode_metadata: Any = None
+        self._async_step_tensors: tuple[Tensor, Tensor, Tensor] | None = None
+        self._max_vllm_spec_tokens: int | None = None
+
+        # Static CUDA-Graph runtime buffers (populated in _initialize_runtime_buffers)
+        self._supports_fast_v3_decode: bool = False
+        self._cg_enabled: bool = False
+        self._cg_mempool: Any = None
+        self._cg_graphs: dict[
+            tuple[int, int, bool, bool, bool], torch.cuda.CUDAGraph
+        ] = {}
+        self._cg_tree_graphs: dict[
+            tuple[int, int, int, int, bool],
+            tuple[torch.cuda.CUDAGraph, dict[str, Tensor]],
+        ] = {}
+        self._cg_prev_fc: Tensor | None = None
+        self._cg_token_ids: Tensor | None = None
+        self._cg_valid_lens: Tensor | None = None
+        self._cg_prev2_ids: Tensor | None = None
+        self._cg_slot_idx: Tensor | None = None
+        self._cg_temps: Tensor | None = None
+        self._cg_state_buf: Tensor | None = None
+        self._cg_out_i64: Tensor | None = None
+        self._cg_out_cpu: Tensor | None = None
+        self._cg_meta_cpu: Tensor | None = None
+        self._cg_meta_gpu: Tensor | None = None
+        self._cg_temps_cpu: Tensor | None = None
+        self._zero_fc_row: Tensor | None = None
+        self._want_nu_state: bool = True
+        self._state_cache_dtype: torch.dtype = torch.float32
 
         self.slot_pool: KvNStateSlotPool | None = None
         self.apc_cache: ZeroReplayAPCStateCache | None = (
@@ -700,10 +748,165 @@ class KvNDSparkVllmProposer:
                 if drafter.config.sample_from_anchor
                 else max(1, int(drafter.block_size) - 1)
             )
+            if self.vllm_config is not None:
+                spec_cfg = getattr(self.vllm_config, "speculative_config", None)
+                spec_num = getattr(spec_cfg, "num_speculative_tokens", None)
+                if spec_num is not None and int(spec_num) > 0:
+                    self._max_vllm_spec_tokens = int(spec_num)
+                    max_k = min(max_k, int(spec_num))
+            min_surv_env = os.environ.get("KVN_VLLM_MIN_SURVIVAL_FLOOR", "").strip()
+            min_surv = float(min_surv_env) if min_surv_env else 0.08
             self.scheduler = PurityLoadAwareAmdahlScheduler(
                 roofline=self._roofline or HardwareRooflineProfile.h200_sxm(),
                 max_horizon=max_k,
+                min_survival_floor=min_surv,
             )
+
+        proto_cache = drafter.allocate_state_cache(1, self.device)
+        self._want_nu_state = (
+            proto_cache.ndim == _RANK_4D and proto_cache.size(1) >= _STEP_STATE_V3_LEN
+        )
+        self._state_cache_dtype = proto_cache.dtype
+
+        adv_params = inspect.signature(drafter.advance_and_draft_step).parameters
+        self._supports_fast_v3_decode = (
+            "prev_context_ids" in adv_params
+            and "temperatures_tensor" in adv_params
+            and "include_draft_probs" in adv_params
+        )
+        self._cg_graphs.clear()
+        self._cg_tree_graphs.clear()
+        self._zero_fc_row = torch.zeros(
+            (1, d_model), dtype=fc_dtype, device=self.device
+        )
+
+        disable_cg = os.environ.get("KVN_VLLM_DISABLE_CUDAGRAPH", "0").strip() == "1"
+        self._cg_enabled = (
+            self.device.type == "cuda"
+            and self._supports_fast_v3_decode
+            and not disable_cg
+        )
+        if self._cg_enabled:
+            self._init_cudagraph_workspace(
+                num_layers=num_layers,
+                n_modes=n_modes,
+                d_model=d_model,
+                fc_dtype=fc_dtype,
+                s_max=int(drafter.block_size) + 1,
+                k_out=(
+                    int(drafter.block_size)
+                    if drafter.config.sample_from_anchor
+                    else max(1, int(drafter.block_size) - 1)
+                ),
+            )
+            self._warmup_triton_kernels()
+
+    @torch.no_grad()
+    def _warmup_triton_kernels(self) -> None:
+        """Eagerly JIT-compile KvN Triton scan/decode kernels before live serving."""
+        if (
+            self.device.type != "cuda"
+            or os.environ.get("KVN_VLLM_SKIP_TRITON_WARMUP", "0").strip() == "1"
+        ):
+            return
+        drafter = self._require_drafter()
+        pool = self._require_slot_pool()
+        d_model = pool.d_model
+        fc_dtype = drafter.fc.weight.dtype
+        for warm_t in (8, 128):
+            dummy_ids = torch.zeros(
+                (1, warm_t), dtype=torch.long, device=self.device
+            )
+            dummy_fc = torch.zeros(
+                (1, warm_t, d_model), dtype=fc_dtype, device=self.device
+            )
+            self._scan_zero_init_chunk(dummy_ids, dummy_fc)
+        if self._supports_fast_v3_decode:
+            sc = drafter.allocate_state_cache(1, self.device)
+            s_max = int(drafter.block_size) + 1
+            z_fc = torch.zeros((1, s_max, d_model), dtype=fc_dtype, device=self.device)
+            z_tok = torch.zeros((1, s_max), dtype=torch.long, device=self.device)
+            z_vlen = torch.ones((1,), dtype=torch.long, device=self.device)
+            z_prev2 = torch.zeros((1, 2), dtype=torch.long, device=self.device)
+            drafter.advance_and_draft_step(
+                z_fc,
+                z_tok,
+                z_vlen,
+                sc.clone(),
+                temperature=0.0,
+                return_details=True,
+                prev_context_ids=z_prev2,
+                include_draft_probs=False,
+            )
+            if getattr(drafter, "kraus_head", None) is not None and hasattr(
+                drafter, "draft_kraus_tree_step"
+            ):
+                drafter.draft_kraus_tree_step(
+                    z_fc,
+                    z_tok,
+                    z_vlen,
+                    sc.clone(),
+                    tree_budget=min(8, max(2, self.tree_budget)),
+                    branch_width=max(2, self.branch_width),
+                    temperature=0.0,
+                    return_q_probs=False,
+                    prev_context_ids=z_prev2,
+                )
+
+    def _init_cudagraph_workspace(
+        self,
+        *,
+        num_layers: int,
+        n_modes: int,
+        d_model: int,
+        fc_dtype: torch.dtype,
+        s_max: int,
+        k_out: int,
+    ) -> None:
+        """Allocate static GPU & pinned-CPU staging buffers for CUDA-Graph decode."""
+        max_b = _MAX_CUDAGRAPH_BATCH
+        n_comp = 3 if self._want_nu_state else 2
+        self._cg_mempool = torch.cuda.graph_pool_handle()
+        self._cg_prev_fc = torch.zeros(
+            (max_b, s_max, d_model), dtype=fc_dtype, device=self.device
+        )
+        self._cg_token_ids = torch.zeros(
+            (max_b, s_max), dtype=torch.long, device=self.device
+        )
+        self._cg_valid_lens = torch.ones(
+            (max_b,), dtype=torch.long, device=self.device
+        )
+        self._cg_prev2_ids = torch.zeros(
+            (max_b, 2), dtype=torch.long, device=self.device
+        )
+        self._cg_slot_idx = torch.zeros(
+            (max_b,), dtype=torch.long, device=self.device
+        )
+        self._cg_temps = torch.zeros(
+            (max_b,), dtype=torch.float32, device=self.device
+        )
+        self._cg_state_buf = torch.zeros(
+            (num_layers, n_comp, max_b, n_modes),
+            dtype=self._state_cache_dtype,
+            device=self.device,
+        )
+        self._cg_out_i64 = torch.zeros(
+            (max_b, 1 + k_out), dtype=torch.long, device=self.device
+        )
+        self._cg_out_cpu = torch.zeros(
+            (max_b, 1 + k_out), dtype=torch.long, device="cpu", pin_memory=True
+        )
+        # Columns: [slot, valid_len, p0, p1, tok_0..S-1, fc_idx_0..S-1]
+        meta_cols = 4 + 2 * s_max
+        self._cg_meta_cpu = torch.zeros(
+            (max_b, meta_cols), dtype=torch.long, device="cpu", pin_memory=True
+        )
+        self._cg_meta_gpu = torch.zeros(
+            (max_b, meta_cols), dtype=torch.long, device=self.device
+        )
+        self._cg_temps_cpu = torch.zeros(
+            (max_b,), dtype=torch.float32, device="cpu", pin_memory=True
+        )
 
     def load_model(self, target_model: nn.Module | None = None) -> None:
         """Load ``KvNDSparkDraftModel`` onto ``self.device`` and set aux layers.
@@ -986,6 +1189,7 @@ class KvNDSparkVllmProposer:
                 self._commit_prefill_contract_output(
                     slot_idx, state_out, fc_seq[-1], len(tok_list)
                 )
+                pool.advance_slot_last2_tokens(slot_idx, tok_list)
                 return slot_idx, restored_tokens
             q_all, p_all, nu_all = self._scan_zero_init_chunk(chunk_tensor, shifted_fc)
         else:
@@ -1001,6 +1205,7 @@ class KvNDSparkVllmProposer:
             tokens_advanced=len(tok_list),
             nu_state=nu_all[:, -1, :] if nu_all is not None else None,
         )
+        pool.advance_slot_last2_tokens(slot_idx, tok_list)
 
         if self.apc_cache is not None and start_offset % self.apc_block_size == 0:
             new_hashes = self.apc_cache.record_sequence_blocks(
@@ -1389,12 +1594,15 @@ class KvNDSparkVllmProposer:
         pur_detail, vac_detail, ent_detail = self._extract_aligned_quantum_details(
             details, int(drafter.block_size), start_k
         )
+        born_calibrated = (not run_tree) and (
+            getattr(drafter, "born_confidence_head", None) is not None
+        )
 
         schedule = self.scheduler.select_horizon(
             confidences=prop_conf,
             active_batch_size=active_batch_size or len(req_ids),
-            purity=pur_detail,
-            p_vac=vac_detail,
+            purity=None if born_calibrated else pur_detail,
+            p_vac=None if born_calibrated else vac_detail,
             draft_entropy=ent_detail,
             temperature=temperature,
         )
@@ -1441,58 +1649,734 @@ class KvNDSparkVllmProposer:
     def preempt_requests(self, req_ids: Sequence[str]) -> None:
         """Offload preempted requests to host RAM so resumption has 0 state loss."""
         pool = self._require_slot_pool()
+        max_saved = max(512, 4 * self.max_num_seqs)
         for rid in req_ids:
             pool.preempt_request(rid)
+        for oldest_rid in pool.evict_excess_preempted(max_saved):
+            self._req_APC_parent_hash.pop(oldest_rid, None)
 
-    def _route_scheduled_vllm_request(
+    def _prefill_requests_batched(  # noqa: C901
         self,
-        rid: str,
-        n_sched: int,
-        fc_slice: Tensor,
-        sampled_b: list[int],
-        total_seq: int,
-        tok_row: Any,
-    ) -> tuple[list[int], Tensor] | None:
-        """Handle prefill/continuation chunks or return ``(commit_toks, fc_slice)``."""
+        prefill_items: list[tuple[str, int, list[int], Tensor, bool]],
+    ) -> None:
+        """Execute 1 or more prefill/continuation chunks in one batched forward pass.
+
+        Preserves exact 0-FLOP ``ZeroReplayAPCStateCache`` 16-token block restore and
+        snapshot recording across all requests in ``prefill_items``.
+        """
+        if not prefill_items:
+            return
+        drafter = self._require_drafter()
         pool = self._require_slot_pool()
-        if not pool.has_request(rid) and not pool.is_preempted(rid):
-            prompt_chunk = [int(t) for t in tok_row[:total_seq]]
-            if len(prompt_chunk) != n_sched:
-                prompt_chunk = prompt_chunk[-n_sched:]
-            self.prefill_request(
-                rid,
-                prompt_chunk,
-                fc_slice,
-                already_projected_fc=True,
-                use_apc=(len(prompt_chunk) == total_seq),
-            )
-            return None
 
-        if not sampled_b:
-            cont_chunk = [int(t) for t in tok_row[total_seq - n_sched : total_seq]]
-            self.prefill_request(
-                rid,
-                cont_chunk,
-                fc_slice,
-                already_projected_fc=True,
-                use_apc=False,
+        prepared: list[tuple[str, int, list[int], Tensor, int, bool, int]] = []
+        for rid, slot_idx, raw_toks, raw_fc, use_apc in prefill_items:
+            fc_cur = (
+                raw_fc.squeeze(0)
+                if raw_fc.ndim == _RANK_3D and raw_fc.size(0) == 1
+                else raw_fc
             )
-            return None
+            tok_cur = raw_toks
+            p_hash = self._req_APC_parent_hash.get(rid, 0)
+            if (
+                use_apc
+                and self.apc_cache is not None
+                and pool.get_seq_len(slot_idx) == 0
+            ):
+                restored, p_hash, suffix_toks = (
+                    self.apc_cache.match_and_restore_prefix(
+                        tok_cur, slot_pool=pool, slot_idx=slot_idx
+                    )
+                )
+                if restored > 0 and fc_cur.size(0) == len(tok_cur):
+                    fc_cur = fc_cur[restored:]
+                tok_cur = suffix_toks
+            if not tok_cur:
+                self._req_APC_parent_hash[rid] = p_hash
+                continue
+            n_eff = min(len(tok_cur), int(fc_cur.size(0)))
+            if n_eff <= 0:
+                self._req_APC_parent_hash[rid] = p_hash
+                continue
+            tok_eff = tok_cur[-n_eff:]
+            fc_eff = fc_cur[:n_eff]
+            start_offset = pool.get_seq_len(slot_idx)
+            had_prior = pool.get_has_last_fc(slot_idx)
+            prepared.append(
+                (rid, slot_idx, tok_eff, fc_eff, start_offset, had_prior, p_hash)
+            )
 
-        n_commit = min(n_sched, fc_slice.size(0))
-        commit_toks = [int(t) for t in tok_row[total_seq - n_commit : total_seq]]
-        return commit_toks, fc_slice[:n_commit]
+        if not prepared:
+            return
+
+        fwd_sig = inspect.signature(drafter.kvn_layers[0].forward)
+        if len(prepared) == 1 or "initial_state" not in fwd_sig.parameters:
+            for (
+                rid,
+                slot_idx,
+                tok_list,
+                fc_seq,
+                start_offset,
+                had_prior,
+                parent_hash,
+            ) in prepared:
+                shifted_fc = pool.build_causal_shifted_fc(slot_idx, fc_seq).unsqueeze(0)
+                chunk_tensor = torch.tensor(
+                    [tok_list], dtype=torch.long, device=self.device
+                )
+                if not had_prior:
+                    q_all, p_all, nu_all = self._scan_zero_init_chunk(
+                        chunk_tensor, shifted_fc
+                    )
+                else:
+                    q_all, p_all, nu_all = self._step_continuation_chunk(
+                        slot_idx, chunk_tensor, shifted_fc
+                    )
+                pool.commit_slot_state(
+                    slot_idx=slot_idx,
+                    q_state=q_all[:, -1, :],
+                    p_state=p_all[:, -1, :],
+                    last_fc=fc_seq[-1],
+                    tokens_advanced=len(tok_list),
+                    nu_state=nu_all[:, -1, :] if nu_all is not None else None,
+                )
+                pool.advance_slot_last2_tokens(slot_idx, tok_list)
+                if (
+                    self.apc_cache is not None
+                    and start_offset % self.apc_block_size == 0
+                ):
+                    new_hashes = self.apc_cache.record_sequence_blocks(
+                        token_ids=tok_list,
+                        q_per_step=q_all,
+                        p_per_step=p_all,
+                        fc_per_step=fc_seq,
+                        nu_per_step=nu_all,
+                        start_offset=start_offset,
+                        initial_parent_hash=parent_hash,
+                    )
+                    final_hash = new_hashes[-1] if new_hashes else parent_hash
+                else:
+                    final_hash = parent_hash
+                self._req_APC_parent_hash[rid] = final_hash
+            return
+
+        # Vectorized batched [B_pf, T_max, D] causal prefill across kvn_layers
+        b_pf = len(prepared)
+        t_max = max(len(it[2]) for it in prepared)
+        d_model = pool.d_model
+        fc_dtype = drafter.fc.weight.dtype
+
+        chunk_ids_pad = torch.zeros(
+            (b_pf, t_max), dtype=torch.long, device=self.device
+        )
+        shifted_fc_pad = torch.zeros(
+            (b_pf, t_max, d_model), dtype=fc_dtype, device=self.device
+        )
+        reset_mask_pad = torch.zeros(
+            (b_pf, t_max), dtype=torch.bool, device=self.device
+        )
+        slot_idx_list = [it[1] for it in prepared]
+        slot_idx_gpu = torch.tensor(slot_idx_list, dtype=torch.long, device=self.device)
+
+        for i_pf, (_, slot_idx, tok_list, fc_seq, _, had_prior, _) in enumerate(
+            prepared
+        ):
+            t_len = len(tok_list)
+            chunk_ids_pad[i_pf, :t_len] = torch.tensor(
+                tok_list, dtype=torch.long, device=self.device
+            )
+            shifted_fc_pad[i_pf, :t_len, :] = pool.build_causal_shifted_fc(
+                slot_idx, fc_seq.to(fc_dtype)
+            )
+            if not had_prior:
+                reset_mask_pad[i_pf, 0] = True
+
+        x_cur = shifted_fc_pad + drafter.embed_tokens(chunk_ids_pad).to(fc_dtype)
+        q0_all = pool.q_pool.index_select(0, slot_idx_gpu)  # [B_pf, L, M]
+        p0_all = pool.p_pool.index_select(0, slot_idx_gpu)
+        nu0_all = (
+            pool.nu_pool.index_select(0, slot_idx_gpu)
+            if pool.nu_pool is not None
+            else None
+        )
+
+        q_layers: list[Tensor] = []
+        p_layers: list[Tensor] = []
+        nu_layers: list[Tensor] = []
+        for l_idx, kvn_layer in enumerate(drafter.kvn_layers):
+            q0 = q0_all[:, l_idx, :]
+            p0 = p0_all[:, l_idx, :]
+            l_init: tuple[Tensor, ...] = (
+                (q0, p0, nu0_all[:, l_idx, :]) if nu0_all is not None else (q0, p0)
+            )
+            fwd_kw: dict[str, Any] = {
+                "reset_mask": reset_mask_pad,
+                "initial_state": l_init,
+            }
+            if "state_dtype" in fwd_sig.parameters:
+                fwd_kw["state_dtype"] = torch.float32
+            if "return_nu" in fwd_sig.parameters and pool.use_lindblad_purity:
+                fwd_kw["return_nu"] = True
+            x_cur, q_seq, p_seq, _, nu_seq = _unpack_layer_forward_outputs(
+                kvn_layer(x_cur, **fwd_kw)
+            )
+            q_layers.append(q_seq.to(torch.float32))
+            p_layers.append(p_seq.to(torch.float32))
+            if nu_seq is not None:
+                nu_layers.append(nu_seq.to(torch.float32))
+
+        # q_stack: [L, B_pf, T_max, M]
+        q_stack = torch.stack(q_layers, dim=0)
+        p_stack = torch.stack(p_layers, dim=0)
+        nu_stack = torch.stack(nu_layers, dim=0) if nu_layers else None
+
+        for i_pf, (
+            rid,
+            slot_idx,
+            tok_list,
+            fc_seq,
+            start_offset,
+            _,
+            parent_hash,
+        ) in enumerate(prepared):
+            t_len = len(tok_list)
+            q_i = q_stack[:, i_pf, :t_len, :]
+            p_i = p_stack[:, i_pf, :t_len, :]
+            nu_i = nu_stack[:, i_pf, :t_len, :] if nu_stack is not None else None
+            pool.commit_slot_state(
+                slot_idx=slot_idx,
+                q_state=q_i[:, -1, :],
+                p_state=p_i[:, -1, :],
+                last_fc=fc_seq[-1],
+                tokens_advanced=t_len,
+                nu_state=nu_i[:, -1, :] if nu_i is not None else None,
+            )
+            pool.advance_slot_last2_tokens(slot_idx, tok_list)
+            if self.apc_cache is not None and start_offset % self.apc_block_size == 0:
+                new_hashes = self.apc_cache.record_sequence_blocks(
+                    token_ids=tok_list,
+                    q_per_step=q_i,
+                    p_per_step=p_i,
+                    fc_per_step=fc_seq,
+                    nu_per_step=nu_i,
+                    start_offset=start_offset,
+                    initial_parent_hash=parent_hash,
+                )
+                final_hash = new_hashes[-1] if new_hashes else parent_hash
+            else:
+                final_hash = parent_hash
+            self._req_APC_parent_hash[rid] = final_hash
+
+    @staticmethod
+    def _select_cg_bucket(batch_size: int) -> int:
+        """Select smallest CUDA-Graph batch bucket >= ``batch_size``."""
+        for b in _CUDAGRAPH_BATCH_BUCKETS:
+            if b >= batch_size:
+                return b
+        return batch_size
+
+    @staticmethod
+    def _extract_kraus_tree_spine_static(
+        tree_dict: dict[str, Tensor],
+        k_out: int,
+    ) -> tuple[Tensor, Tensor]:
+        """Extract causal root-to-leaf spine ``[B, k_out]`` + confs with 0 syncs."""
+        t_ids = tree_dict["tree_draft_ids"]
+        t_par = tree_dict["tree_parent_idx"]
+        t_dep = tree_dict["tree_depths"]
+        t_surv = tree_dict["tree_survival"].float().clamp(0.0, 1.0)
+        bsz = t_ids.size(0)
+        dev = t_ids.device
+
+        # Choose deepest highest-survival leaf and trace exact parent pointers to root
+        leaf_score = t_dep.float() * 10.0 + t_surv
+        cur = leaf_score.argmax(dim=-1, keepdim=True)  # [B, 1]
+        spine_ids = torch.zeros((bsz, k_out), dtype=torch.long, device=dev)
+        for _ in range(k_out):
+            safe_idx = cur.clamp_min(0)
+            dep_u = t_dep.gather(1, safe_idx)
+            tok_u = t_ids.gather(1, safe_idx)
+            col_u = (dep_u - 1).clamp(0, max(0, k_out - 1))
+            valid_u = (cur >= 0) & (dep_u >= 1) & (dep_u <= k_out)
+            cur_val = spine_ids.gather(1, col_u)
+            spine_ids.scatter_(1, col_u, torch.where(valid_u, tok_u, cur_val))
+            par_u = t_par.gather(1, safe_idx)
+            cur = torch.where(cur >= 0, par_u, cur)
+
+        prev_s = torch.ones((bsz,), dtype=torch.float32, device=dev)
+        alphas: list[Tensor] = []
+        for depth_val in range(1, k_out + 1):
+            masked_s = torch.where(
+                t_dep == depth_val, t_surv, torch.zeros_like(t_surv)
+            )
+            s_d = torch.minimum(masked_s.max(dim=-1).values, prev_s)
+            alpha_d = torch.where(
+                prev_s > _PROB_EPS,
+                (s_d / prev_s.clamp_min(_PROB_EPS)).clamp(0.0, 1.0),
+                torch.zeros_like(s_d),
+            )
+            alphas.append(alpha_d)
+            prev_s = s_d
+        return spine_ids, torch.stack(alphas, dim=1)
+
+    def _require_cg_buffers(
+        self,
+    ) -> tuple[
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+    ]:
+        """Return validated CUDA-Graph workspace buffers or raise ``RuntimeError``."""
+        if (
+            self._cg_slot_idx is None
+            or self._cg_prev_fc is None
+            or self._cg_token_ids is None
+            or self._cg_valid_lens is None
+            or self._cg_prev2_ids is None
+            or self._cg_temps is None
+            or self._cg_state_buf is None
+            or self._cg_out_i64 is None
+            or self._cg_out_cpu is None
+            or self._cg_meta_cpu is None
+            or self._cg_meta_gpu is None
+            or self._cg_temps_cpu is None
+        ):
+            raise RuntimeError("CUDA-Graph workspace buffers are not initialized.")
+        return (
+            self._cg_slot_idx,
+            self._cg_prev_fc,
+            self._cg_token_ids,
+            self._cg_valid_lens,
+            self._cg_prev2_ids,
+            self._cg_temps,
+            self._cg_state_buf,
+            self._cg_out_i64,
+            self._cg_out_cpu,
+            self._cg_meta_cpu,
+            self._cg_meta_gpu,
+            self._cg_temps_cpu,
+        )
+
+    def _run_decode_graph_body(
+        self,
+        b_bucket: int,
+        s_bucket: int,
+        is_stochastic: bool,
+        run_tree: bool,
+        max_spec_cap: int,
+        compute_prev2_from_pool: bool = False,
+    ) -> None:
+        """Zero-sync GPU kernel sequence captured inside ``torch.cuda.CUDAGraph``."""
+        drafter = self._require_drafter()
+        pool = self._require_slot_pool()
+        if self.scheduler is None:
+            raise RuntimeError("Amdahl scheduler is not initialized.")
+        (
+            cg_slot_idx,
+            cg_prev_fc,
+            cg_token_ids,
+            cg_valid_lens,
+            cg_prev2_ids,
+            cg_temps,
+            cg_state_buf,
+            cg_out_i64,
+            _,
+            _,
+            _,
+            _,
+        ) = self._require_cg_buffers()
+
+        slot_v = cg_slot_idx[:b_bucket]
+        prev_fc_v = cg_prev_fc[:b_bucket, :s_bucket, :]
+        tok_v = cg_token_ids[:b_bucket, :s_bucket]
+        vlen_v = cg_valid_lens[:b_bucket]
+        if compute_prev2_from_pool:
+            pool_last2 = pool.last2_tokens_pool.index_select(0, slot_v)
+            w_tok = torch.cat([pool_last2, tok_v], dim=1)
+            vlen_safe = vlen_v.clamp(min=1, max=s_bucket)
+            p0_col = w_tok.gather(1, (vlen_safe - 1).unsqueeze(1))
+            p1_col = w_tok.gather(1, vlen_safe.unsqueeze(1))
+            prev2_v = torch.cat([p0_col, p1_col], dim=1)
+            last_col = w_tok.gather(1, (vlen_safe + 1).unsqueeze(1))
+            pool.last2_tokens_pool.index_copy_(
+                0, slot_v, torch.cat([p1_col, last_col], dim=1)
+            )
+        else:
+            prev2_v = cg_prev2_ids[:b_bucket, :]
+        temps_v = cg_temps[:b_bucket]
+        state_v = cg_state_buf[:, :, :b_bucket, :]
+        out_v = cg_out_i64[:b_bucket, :]
+        k_out = out_v.size(1) - 1
+        start_k = 0 if drafter.config.sample_from_anchor else 1
+
+        pool.gather_into_state_buffer(slot_v, state_v)
+
+        if not run_tree:
+            draft_ids, updated_cache, details = drafter.advance_and_draft_step(
+                prev_fc_v,
+                tok_v,
+                vlen_v,
+                state_v,
+                temperature=(1.0 if is_stochastic else 0.0),
+                return_details=True,
+                prev_context_ids=prev2_v,
+                temperatures_tensor=(temps_v if is_stochastic else None),
+                include_draft_probs=False,
+            )
+            pool.scatter_from_state_buffer(slot_v, updated_cache)
+            prop_ids = draft_ids[:, start_k:]
+            prop_conf = details["confidences"][:, start_k:].to(torch.float32)
+            pur_raw = details.get("purity")
+            vac_raw = details.get("p_vac")
+        else:
+            tree_dict, updated_cache = drafter.draft_kraus_tree_step(
+                prev_fc_v,
+                tok_v,
+                vlen_v,
+                state_v,
+                tree_budget=self.tree_budget,
+                branch_width=self.branch_width,
+                temperature=(0.6 if is_stochastic else 0.0),
+                return_q_probs=False,
+                prev_context_ids=prev2_v,
+            )
+            pool.scatter_from_state_buffer(slot_v, updated_cache)
+            prop_ids, prop_conf = self._extract_kraus_tree_spine_static(
+                tree_dict, k_out
+            )
+            pur_raw = tree_dict.get("purity")
+            vac_raw = tree_dict.get("p_vac")
+
+        if (
+            pur_raw is not None
+            and pur_raw.ndim >= _RANK_2D
+            and pur_raw.size(1) == int(drafter.block_size)
+            and start_k > 0
+        ):
+            pur_raw = pur_raw[:, start_k:]
+        if (
+            vac_raw is not None
+            and vac_raw.ndim >= _RANK_2D
+            and vac_raw.size(1) == int(drafter.block_size)
+            and start_k > 0
+        ):
+            vac_raw = vac_raw[:, start_k:]
+
+        eff_cap = min(max_spec_cap, prop_ids.size(1), k_out)
+        born_calibrated = (not run_tree) and (
+            getattr(drafter, "born_confidence_head", None) is not None
+        )
+        horizons = self.scheduler.select_horizon_tensor(
+            confidences=prop_conf[:, :eff_cap],
+            active_batch_size=b_bucket,
+            purity=None
+            if born_calibrated
+            else (
+                pur_raw[:, :eff_cap]
+                if (pur_raw is not None and pur_raw.ndim == _RANK_2D)
+                else pur_raw
+            ),
+            p_vac=None
+            if born_calibrated
+            else (
+                vac_raw[:, :eff_cap]
+                if (vac_raw is not None and vac_raw.ndim == _RANK_2D)
+                else vac_raw
+            ),
+            temperature=0.0,
+            temperatures_tensor=(temps_v if is_stochastic else None),
+            valid_mask=(slot_v < pool.scratch_slot_base),
+        ).clamp(min=1, max=eff_cap)
+
+        out_v[:, 0] = horizons
+        out_v[:, 1 : 1 + eff_cap] = prop_ids[:, :eff_cap]
+
+    def _get_or_capture_decode_graph(
+        self,
+        b_bucket: int,
+        s_bucket: int,
+        is_stochastic: bool,
+        run_tree: bool,
+        max_spec_cap: int,
+        compute_prev2_from_pool: bool = False,
+    ) -> torch.cuda.CUDAGraph:
+        """Lazily capture ``CUDAGraph`` on dedicated scratch slots (0 active drift)."""
+        key = (b_bucket, s_bucket, is_stochastic, run_tree, compute_prev2_from_pool)
+        cached = self._cg_graphs.get(key)
+        if cached is not None:
+            return cached
+
+        pool = self._require_slot_pool()
+        (
+            cg_slot_idx,
+            cg_prev_fc,
+            cg_token_ids,
+            cg_valid_lens,
+            cg_prev2_ids,
+            cg_temps,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        ) = self._require_cg_buffers()
+
+        scratch_base = pool.scratch_slot_base
+        scratch_slots = torch.arange(
+            scratch_base,
+            scratch_base + b_bucket,
+            dtype=torch.long,
+            device=self.device,
+        )
+        cg_slot_idx[:b_bucket].copy_(scratch_slots)
+        cg_prev_fc[:b_bucket, :s_bucket].zero_()
+        cg_token_ids[:b_bucket, :s_bucket].zero_()
+        cg_valid_lens[:b_bucket].fill_(1)
+        cg_prev2_ids[:b_bucket].zero_()
+        cg_temps[:b_bucket].fill_(0.6 if is_stochastic else 0.0)
+
+        s_cap = torch.cuda.Stream(device=self.device)
+        s_cap.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(s_cap):
+            for _ in range(2):
+                self._run_decode_graph_body(
+                    b_bucket,
+                    s_bucket,
+                    is_stochastic,
+                    run_tree,
+                    max_spec_cap,
+                    compute_prev2_from_pool=compute_prev2_from_pool,
+                )
+        torch.cuda.current_stream(self.device).wait_stream(s_cap)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=self._cg_mempool, stream=s_cap):
+            self._run_decode_graph_body(
+                b_bucket,
+                s_bucket,
+                is_stochastic,
+                run_tree,
+                max_spec_cap,
+                compute_prev2_from_pool=compute_prev2_from_pool,
+            )
+        torch.cuda.current_stream(self.device).wait_stream(s_cap)
+
+        # Clean scratch pool rows touched during warmup/capture
+        pool.q_pool[scratch_base : scratch_base + b_bucket].zero_()
+        pool.p_pool[scratch_base : scratch_base + b_bucket].zero_()
+        if pool.nu_pool is not None:
+            pool.nu_pool[scratch_base : scratch_base + b_bucket].zero_()
+        pool.last2_tokens_pool[scratch_base : scratch_base + b_bucket].zero_()
+
+        self._cg_graphs[key] = graph
+        return graph
 
     @torch.no_grad()
-    def propose_vllm_step(
+    def propose_tree_cudagraph(
+        self,
+        prev_fc_block: Tensor,
+        token_ids_block: Tensor,
+        valid_lens: Tensor,
+        state_cache: Tensor,
+        *,
+        tree_budget: int | None = None,
+        branch_width: int | None = None,
+        temperature: float = 0.0,
+        prev_context_ids: Tensor | None = None,
+    ) -> tuple[dict[str, Tensor], Tensor]:
+        """CUDA-Graph-captured vectorized ``[B * W]`` Kraus POVM tree step."""
+        drafter = self._require_drafter()
+        budget = int(tree_budget or self.tree_budget)
+        width = int(branch_width or self.branch_width)
+        bsz, s_len, d_model = prev_fc_block.shape
+        is_stoch = float(temperature) > 0.0
+
+        if (
+            not self._cg_enabled
+            or bsz not in _CUDAGRAPH_BATCH_BUCKETS
+            or (
+                self.device.type == "cuda"
+                and torch.cuda.is_current_stream_capturing()
+            )
+        ):
+            out_dict, out_sc = drafter.draft_kraus_tree_step(
+                prev_fc_block,
+                token_ids_block,
+                valid_lens,
+                state_cache,
+                tree_budget=budget,
+                branch_width=width,
+                temperature=float(temperature),
+                return_q_probs=False,
+                prev_context_ids=prev_context_ids,
+            )
+            if not isinstance(out_sc, Tensor):
+                raise TypeError("Expected Tensor state_cache from tree step.")
+            return out_dict, out_sc
+
+        t_key = (bsz, s_len, budget, width, is_stoch)
+        entry = self._cg_tree_graphs.get(t_key)
+        if entry is None:
+            st_fc = torch.zeros(
+                (bsz, s_len, d_model),
+                dtype=prev_fc_block.dtype,
+                device=self.device,
+            )
+            st_tok = torch.zeros((bsz, s_len), dtype=torch.long, device=self.device)
+            st_vlen = torch.ones((bsz,), dtype=torch.long, device=self.device)
+            st_prev2 = torch.zeros((bsz, 2), dtype=torch.long, device=self.device)
+            st_sc = torch.zeros_like(state_cache)
+
+            s_cap = torch.cuda.Stream(device=self.device)
+            s_cap.wait_stream(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(s_cap):
+                for _ in range(2):
+                    drafter.draft_kraus_tree_step(
+                        st_fc,
+                        st_tok,
+                        st_vlen,
+                        st_sc,
+                        tree_budget=budget,
+                        branch_width=width,
+                        temperature=float(temperature),
+                        return_q_probs=False,
+                        prev_context_ids=st_prev2,
+                    )
+            torch.cuda.current_stream(self.device).wait_stream(s_cap)
+
+            t_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(t_graph, pool=self._cg_mempool, stream=s_cap):
+                cap_dict, cap_sc = drafter.draft_kraus_tree_step(
+                    st_fc,
+                    st_tok,
+                    st_vlen,
+                    st_sc,
+                    tree_budget=budget,
+                    branch_width=width,
+                    temperature=float(temperature),
+                    return_q_probs=False,
+                    prev_context_ids=st_prev2,
+                )
+            torch.cuda.current_stream(self.device).wait_stream(s_cap)
+            if not isinstance(cap_sc, Tensor):
+                raise TypeError("Expected Tensor state_cache from tree step.")
+            bufs: dict[str, Tensor] = {
+                "in_fc": st_fc,
+                "in_tok": st_tok,
+                "in_vlen": st_vlen,
+                "in_prev2": st_prev2,
+                "in_sc": st_sc,
+                "out_sc": cap_sc,
+            }
+            for k_name, v_ten in cap_dict.items():
+                bufs[f"tree::{k_name}"] = v_ten
+            entry = (t_graph, bufs)
+            self._cg_tree_graphs[t_key] = entry
+
+        t_graph, bufs = entry
+        bufs["in_fc"].copy_(prev_fc_block)
+        bufs["in_tok"].copy_(token_ids_block)
+        bufs["in_vlen"].copy_(valid_lens)
+        if prev_context_ids is not None:
+            bufs["in_prev2"].copy_(prev_context_ids)
+        else:
+            bufs["in_prev2"].zero_()
+        bufs["in_sc"].copy_(state_cache)
+        t_graph.replay()
+
+        out_tree = {
+            k_name[6:]: v_ten
+            for k_name, v_ten in bufs.items()
+            if k_name.startswith("tree::")
+        }
+        return out_tree, bufs["out_sc"]
+
+    def _resolve_step_temperatures(
+        self,
+        input_batch: Any,
+        req_ids: list[str],
+        decode_batch_positions: list[int],
+        sampling_metadata: Any,
+    ) -> tuple[bool, list[float] | None, Tensor | None]:
+        """Resolve per-request decode temperatures with 0 GPU->CPU stream syncs."""
+        s_meta = sampling_metadata or self._current_sampling_metadata
+        if s_meta is not None and bool(getattr(s_meta, "all_greedy", False)):
+            return False, None, None
+
+        greedy_reqs = getattr(input_batch, "greedy_reqs", None)
+        random_reqs = getattr(input_batch, "random_reqs", None)
+        if (
+            greedy_reqs is not None
+            and random_reqs is not None
+            and len(random_reqs) == 0
+        ):
+            return False, None, None
+
+        temp_cpu_arr = getattr(input_batch, "temperature_cpu", None)
+        if temp_cpu_arr is not None:
+            temps_list: list[float] = []
+            any_stoch = False
+            for b_pos in decode_batch_positions:
+                rid = req_ids[b_pos]
+                if greedy_reqs is not None and rid in greedy_reqs:
+                    t_val = 0.0
+                else:
+                    t_val = float(temp_cpu_arr[b_pos])
+                    if not math.isfinite(t_val) or t_val < _MIN_TEMP_EPS:
+                        t_val = 0.0
+                if t_val > 0.0:
+                    any_stoch = True
+                temps_list.append(t_val)
+            return any_stoch, (temps_list if any_stoch else None), None
+
+        temp_gpu = getattr(s_meta, "temperature", None) if s_meta is not None else None
+        if isinstance(temp_gpu, Tensor):
+            pos_gpu = torch.tensor(
+                decode_batch_positions, dtype=torch.long, device=temp_gpu.device
+            )
+            gathered = temp_gpu.index_select(0, pos_gpu).to(
+                device=self.device, dtype=torch.float32
+            )
+            gathered = torch.where(
+                torch.isfinite(gathered) & (gathered >= _MIN_TEMP_EPS),
+                gathered,
+                torch.zeros_like(gathered),
+            )
+            return True, None, gathered
+
+        return False, None, None
+
+    @torch.no_grad()
+    def propose_vllm_step(  # noqa: C901
         self,
         runner: Any,
         scheduler_output: Any,
         sampled_token_ids: Tensor | list[list[int]],
         aux_hidden_states: list[Tensor] | None,
+        sampling_metadata: Any = None,
     ) -> list[list[int]]:
-        """Execute one live ``vLLM V1`` ``GPUModelRunner`` speculative proposal step."""
+        """Execute one live ``vLLM V1`` ``GPUModelRunner`` speculative proposal step.
+
+        Implements exact 3-case inductive token/hidden-state alignment (zero rejected
+        draft state corruption across chunked prefill, vLLM prefix cache, step-0 decode,
+        preemption, and speculative verification) plus zero-sync static-slot
+        ``torch.cuda.CUDAGraph`` decode execution.
+        """
+        drafter = self._require_drafter()
         pool = self._require_slot_pool()
+        if self.scheduler is None:
+            raise RuntimeError("Amdahl scheduler is not initialized.")
+
         finished = getattr(scheduler_output, "finished_req_ids", None) or ()
         if finished:
             self.free_finished_requests(list(finished))
@@ -1503,60 +2387,1128 @@ class KvNDSparkVllmProposer:
             return [[] for _ in req_ids]
 
         active_set = set(req_ids)
-        stale = [rid for rid in pool.active_request_ids() if rid not in active_set]
-        if stale:
-            self.preempt_requests(stale)
+        if pool.num_active_requests > 0:
+            stale = [rid for rid in pool.active_request_ids() if rid not in active_set]
+            if stale:
+                self.preempt_requests(stale)
 
-        fc_flat = self.extract_fc_hidden(aux_hidden_states, already_projected=False)
         num_scheduled_map: dict[str, int] = getattr(
             scheduler_output, "num_scheduled_tokens", {}
         )
+        total_sched = int(
+            getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0
+        )
+        if total_sched <= 0 and num_scheduled_map:
+            total_sched = sum(int(num_scheduled_map.get(r, 1)) for r in req_ids)
+        sliced_aux: Tensor | list[Tensor]
+        if total_sched > 0:
+            sliced_aux = (
+                [h[:total_sched] for h in aux_hidden_states]
+                if isinstance(aux_hidden_states, (list, tuple))
+                else aux_hidden_states[:total_sched]
+            )
+        else:
+            sliced_aux = aux_hidden_states
+
+        fc_flat = self.extract_fc_hidden(sliced_aux, already_projected=False)
+        n_total_fc = int(fc_flat.size(0))
+        pool_base = n_total_fc
+        zero_fc_idx = pool_base + int(pool.last_fc_pool.size(0))
         sampled_rows = (
             sampled_token_ids.detach().cpu().tolist()
             if isinstance(sampled_token_ids, Tensor)
-            else [list(r) for r in sampled_token_ids]
+            else sampled_token_ids
+        )
+        num_tokens_no_spec = input_batch.num_tokens_no_spec
+        token_ids_cpu = input_batch.token_ids_cpu
+
+        s_max = int(drafter.block_size) + 1
+        k_out = (
+            int(drafter.block_size)
+            if drafter.config.sample_from_anchor
+            else max(1, int(drafter.block_size) - 1)
+        )
+        max_spec_cap = (
+            min(k_out, self._max_vllm_spec_tokens)
+            if self._max_vllm_spec_tokens is not None
+            else k_out
         )
 
-        decode_reqs: list[str] = []
-        decode_toks: list[list[int]] = []
-        decode_fcs: list[Tensor] = []
+        prefill_queue: list[tuple[str, int, list[int], Tensor, bool]] = []
+        # Decode batch staging lists (CPU ints only, 0 CUDA syncs)
         decode_positions: list[int] = []
-        cursor = 0
+        decode_slots: list[int] = []
+        decode_toks: list[list[int]] = []
+        decode_fc_src: list[list[int]] = []
+        decode_prev2: list[tuple[int, int]] = []
+        last_fc_update_slots: list[int] = []
+        last_fc_update_src: list[int] = []
 
+        cursor = 0
         for b_idx, rid in enumerate(req_ids):
             n_sched = int(num_scheduled_map.get(rid, 1))
-            fc_slice = fc_flat[cursor : cursor + n_sched]
+            c_start = cursor
             cursor += n_sched
-            sampled_b = [int(t) for t in sampled_rows[b_idx] if int(t) >= 0]
-            routed = self._route_scheduled_vllm_request(
-                rid=rid,
-                n_sched=n_sched,
-                fc_slice=fc_slice,
-                sampled_b=sampled_b,
-                total_seq=int(input_batch.num_tokens_no_spec[b_idx]),
-                tok_row=input_batch.token_ids_cpu[b_idx],
-            )
-            if routed is not None:
-                commit_toks, commit_fc = routed
-                decode_reqs.append(rid)
-                decode_toks.append(commit_toks)
-                decode_fcs.append(commit_fc)
+            raw_samp = sampled_rows[b_idx]
+            sampled_b = [int(t) for t in raw_samp if int(t) >= 0]
+            n_samp = len(sampled_b)
+            total_seq = int(num_tokens_no_spec[b_idx])
+            tok_row = token_ids_cpu[b_idx]
+            row_cap = len(tok_row)
+
+            if not pool.has_request(rid) and pool.is_preempted(rid):
+                saved = pool.get_preempted_state(rid)
+                target_prior = (total_seq - n_samp) if n_samp > 0 else total_seq
+                if saved is None or saved.seq_len != target_prior or (
+                    target_prior > 1 and n_sched == target_prior
+                ):
+                    pool.free_request(rid)
+                else:
+                    pool.get_or_allocate_slot(rid)
+
+            # Case 1: Intermediate chunked prefill (no token sampled yet)
+            if n_samp == 0:
+                slot_idx, is_new = pool.get_or_allocate_slot(rid)
+                c_len = min(n_sched, max(0, n_total_fc - c_start))
+                if c_len > 0:
+                    chunk_start = max(0, total_seq - c_len)
+                    chunk_toks = [int(t) for t in tok_row[chunk_start:total_seq]]
+                    prefill_queue.append(
+                        (
+                            rid,
+                            slot_idx,
+                            chunk_toks,
+                            fc_flat[c_start : c_start + c_len],
+                            bool(is_new and chunk_start == 0),
+                        )
+                    )
+                continue
+
+            slot_idx, is_new = pool.get_or_allocate_slot(rid)
+            seq_committed = pool.get_seq_len(slot_idx)
+            expected_prior = max(0, total_seq - n_samp)
+
+            # Case 3: Steady-state speculative decode verification step
+            if not is_new and seq_committed == expected_prior:
+                avail_fc = max(0, n_total_fc - c_start)
+                v_len = min(n_samp, avail_fc, s_max)
+                if v_len <= 0:
+                    continue
+                commit_toks = sampled_b[-v_len:]
+                fc_indices = [c_start + j for j in range(v_len)]
+                last_fc_update_slots.append(slot_idx)
+                last_fc_update_src.append(c_start + v_len - 1)
+
+                anc_pos = max(0, min(total_seq - 1, row_cap - 1))
+                p0 = int(tok_row[anc_pos - 2]) if anc_pos >= _PREV2_MIN_POS else 0
+                p1 = int(tok_row[anc_pos - 1]) if anc_pos >= 1 else 0
+
+                pool.set_slot_meta(slot_idx, seq_len=total_seq, has_last_fc=False)
                 decode_positions.append(b_idx)
+                decode_slots.append(slot_idx)
+                decode_toks.append(commit_toks)
+                decode_fc_src.append(fc_indices)
+                decode_prev2.append((p0, p1))
+                continue
+
+            # Case 2: Final prefill / vLLM prefix-cache hit / recompute -> Step-0 decode
+            prompt_len = expected_prior
+            if seq_committed > prompt_len:
+                pool.reset_slot(slot_idx)
+                self._req_APC_parent_hash.pop(rid, None)
+                seq_committed = 0
+                is_new = True
+
+            if prompt_len > 0 and seq_committed < prompt_len:
+                avail_fc = max(0, n_total_fc - c_start)
+                n_pf_fc = min(n_sched, avail_fc, prompt_len - seq_committed)
+                if n_pf_fc > 0:
+                    if is_new and n_pf_fc == prompt_len:
+                        pf_toks = [int(t) for t in tok_row[:prompt_len]]
+                        prefill_queue.append(
+                            (
+                                rid,
+                                slot_idx,
+                                pf_toks,
+                                fc_flat[c_start : c_start + n_pf_fc],
+                                True,
+                            )
+                        )
+                    elif is_new and n_pf_fc < prompt_len:
+                        prefix_skip = prompt_len - n_pf_fc
+                        restored = 0
+                        if self.apc_cache is not None:
+                            prefix_toks = [int(t) for t in tok_row[:prefix_skip]]
+                            restored, p_hash, _ = (
+                                self.apc_cache.match_and_restore_prefix(
+                                    prefix_toks,
+                                    slot_pool=pool,
+                                    slot_idx=slot_idx,
+                                    require_uncomputed_tail=False,
+                                )
+                            )
+                            if restored > 0:
+                                self._req_APC_parent_hash[rid] = p_hash
+                        if restored < prefix_skip:
+                            pool.set_slot_meta(
+                                slot_idx, seq_len=prefix_skip, has_last_fc=False
+                            )
+                        suf_toks = [int(t) for t in tok_row[prefix_skip:prompt_len]]
+                        prefill_queue.append(
+                            (
+                                rid,
+                                slot_idx,
+                                suf_toks,
+                                fc_flat[c_start : c_start + n_pf_fc],
+                                False,
+                            )
+                        )
+                    else:
+                        cont_start = prompt_len - n_pf_fc
+                        cont_toks = [int(t) for t in tok_row[cont_start:prompt_len]]
+                        prefill_queue.append(
+                            (
+                                rid,
+                                slot_idx,
+                                cont_toks,
+                                fc_flat[c_start : c_start + n_pf_fc],
+                                False,
+                            )
+                        )
+
+            # Immediately draft from newly sampled Step-0 bonus token(s)
+            v_len0 = min(n_samp, s_max)
+            commit_toks0 = sampled_b[-v_len0:]
+            first_src = (pool_base + slot_idx) if prompt_len > 0 else zero_fc_idx
+            fc_indices0 = [first_src] + [zero_fc_idx] * (v_len0 - 1)
+
+            anc_pos = max(0, min(total_seq - 1, row_cap - 1))
+            p0 = int(tok_row[anc_pos - 2]) if anc_pos >= _PREV2_MIN_POS else 0
+            p1 = int(tok_row[anc_pos - 1]) if anc_pos >= 1 else 0
+
+            decode_positions.append(b_idx)
+            decode_slots.append(slot_idx)
+            decode_toks.append(commit_toks0)
+            decode_fc_src.append(fc_indices0)
+            decode_prev2.append((p0, p1))
+
+        # 1. Execute all queued prefill/continuation chunks first so last_fc_pool[slot]
+        #    holds exact fc_{P-1} before Step-0 decode gathers it!
+        if prefill_queue:
+            self._prefill_requests_batched(prefill_queue)
+        # Finalize seq_lens for any Case 2 requests whose prefill just ran
+        for pos_i, slot_i in zip(decode_positions, decode_slots, strict=True):
+            pool.set_slot_meta(
+                slot_i, seq_len=int(num_tokens_no_spec[pos_i]), has_last_fc=False
+            )
 
         proposals: list[list[int]] = [[] for _ in req_ids]
-        if not decode_reqs:
+        decode_count = len(decode_slots)
+        if decode_count == 0:
             return proposals
 
-        out = self.propose_batch(
-            decode_reqs,
-            decode_toks,
-            decode_fcs,
-            already_projected_fc=True,
-            active_batch_size=len(req_ids),
+        # Update last_fc_pool for Case 3 slots in one vectorized GPU copy
+        if last_fc_update_slots:
+            upd_dst = torch.tensor(
+                last_fc_update_slots, dtype=torch.long, device=self.device
+            )
+            upd_src = torch.tensor(
+                last_fc_update_src, dtype=torch.long, device=self.device
+            )
+            pool.last_fc_pool.index_copy_(0, upd_dst, fc_flat.index_select(0, upd_src))
+
+        if self._zero_fc_row is None:
+            raise RuntimeError("Zero fc row is not initialized.")
+        fc_sources = torch.cat([fc_flat, pool.last_fc_pool, self._zero_fc_row], dim=0)
+
+        is_stoch, temps_cpu_list, temps_gpu_vec = self._resolve_step_temperatures(
+            input_batch=input_batch,
+            req_ids=req_ids,
+            decode_batch_positions=decode_positions,
+            sampling_metadata=sampling_metadata,
         )
-        for pos, toks in zip(decode_positions, out.draft_token_ids, strict=True):
-            proposals[pos] = toks
+
+        # Preserve vLLM V1 CUDAGraphMode.FULL (which requires uniform query_len ==
+        # 1 + num_spec_tokens across all requests) whenever the batch fits inside the
+        # verifier's captured FULL cudagraph token ceiling; above that ceiling, use
+        # live PurityLoadAwareAmdahlScheduler dynamic horizon throttling.
+        force_dyn = (
+            os.environ.get("KVN_VLLM_FORCE_DYNAMIC_HORIZON", "0").strip() == "1"
+        )
+        runner_uniform_q = getattr(runner, "uniform_decode_query_len", None)
+        comp_cfg = getattr(runner, "compilation_config", None)
+        cg_cap_env = os.environ.get("KVN_VLLM_FULL_CG_MAX_TOKENS", "").strip()
+        max_cg_tokens = (
+            int(cg_cap_env)
+            if cg_cap_env
+            else int(getattr(comp_cfg, "max_cudagraph_capture_size", 512) or 512)
+        )
+        preserve_vllm_full_cg = (
+            not force_dyn
+            and runner_uniform_q is not None
+            and int(runner_uniform_q) == 1 + max_spec_cap
+            and decode_count == len(req_ids)
+            and (decode_count * int(runner_uniform_q) <= max_cg_tokens)
+        )
+
+        # 2. Fast zero-sync CUDA-Graph decode path (B <= 128 on CUDA)
+        if (
+            self._cg_enabled
+            and decode_count <= _MAX_CUDAGRAPH_BATCH
+            and not (
+                self.device.type == "cuda"
+                and torch.cuda.is_current_stream_capturing()
+            )
+        ):
+            self._require_cg_buffers()
+
+            b_bucket = self._select_cg_bucket(decode_count)
+            max_vlen = max(len(t) for t in decode_toks)
+            s_bucket = min(4, s_max) if max_vlen <= min(4, s_max) else s_max
+
+            # Ensure graph is captured BEFORE writing live request slots into buffers!
+            graph = self._get_or_capture_decode_graph(
+                b_bucket=b_bucket,
+                s_bucket=s_bucket,
+                is_stochastic=is_stoch,
+                run_tree=self.use_kraus_tree,
+                max_spec_cap=max_spec_cap,
+            )
+
+            meta_cols_used = 4 + 2 * s_bucket
+            scratch_base = pool.scratch_slot_base
+            # Build flat Python table -> 1 tensor construction -> 1 pinned H2D DMA
+            rows_flat: list[list[int]] = []
+            for r_idx in range(decode_count):
+                toks_r = decode_toks[r_idx]
+                fcs_r = decode_fc_src[r_idx]
+                v_len = len(toks_r)
+                p0, p1 = decode_prev2[r_idx]
+                pad_len = s_bucket - v_len
+                rows_flat.append(
+                    [decode_slots[r_idx], v_len, p0, p1]
+                    + toks_r
+                    + ([0] * pad_len)
+                    + fcs_r
+                    + ([zero_fc_idx] * pad_len)
+                )
+            pad_tok_fc = [0] * s_bucket + [zero_fc_idx] * s_bucket
+            for r_idx in range(decode_count, b_bucket):
+                rows_flat.append([scratch_base + r_idx, 1, 0, 0] + pad_tok_fc)
+
+            meta_view_cpu = self._cg_meta_cpu[:b_bucket, :meta_cols_used]
+            meta_view_cpu.copy_(torch.tensor(rows_flat, dtype=torch.long))
+            meta_view_gpu = self._cg_meta_gpu[:b_bucket, :meta_cols_used]
+            meta_view_gpu.copy_(meta_view_cpu, non_blocking=True)
+
+            self._cg_slot_idx[:b_bucket].copy_(meta_view_gpu[:, 0])
+            self._cg_valid_lens[:b_bucket].copy_(meta_view_gpu[:, 1])
+            self._cg_prev2_ids[:b_bucket, :].copy_(meta_view_gpu[:, 2:4])
+            self._cg_token_ids[:b_bucket, :s_bucket].copy_(
+                meta_view_gpu[:, 4 : 4 + s_bucket]
+            )
+            fc_idx_flat = meta_view_gpu[:, 4 + s_bucket : meta_cols_used].reshape(-1)
+            gathered_fc = fc_sources.index_select(0, fc_idx_flat).view(
+                b_bucket, s_bucket, pool.d_model
+            )
+            self._cg_prev_fc[:b_bucket, :s_bucket, :].copy_(gathered_fc)
+
+            if is_stoch:
+                if temps_cpu_list is not None:
+                    padded_t = temps_cpu_list + [0.0] * (b_bucket - decode_count)
+                    t_cpu = self._cg_temps_cpu[:b_bucket]
+                    t_cpu.copy_(torch.tensor(padded_t, dtype=torch.float32))
+                    self._cg_temps[:b_bucket].copy_(t_cpu, non_blocking=True)
+                elif temps_gpu_vec is not None:
+                    self._cg_temps[:decode_count].copy_(temps_gpu_vec)
+                    if b_bucket > decode_count:
+                        self._cg_temps[decode_count:b_bucket].zero_()
+
+            graph.replay()
+
+            out_cpu_slice = self._cg_out_cpu[:decode_count, :]
+            out_cpu_slice.copy_(
+                self._cg_out_i64[:decode_count, :], non_blocking=False
+            )
+            out_rows = out_cpu_slice.tolist()
+            for pos_i, row in zip(decode_positions, out_rows, strict=True):
+                k_req = (
+                    max_spec_cap
+                    if preserve_vllm_full_cg
+                    else max(1, min(int(row[0]), max_spec_cap))
+                )
+                proposals[pos_i] = row[1 : 1 + k_req]
+            return proposals
+
+        # 3. Vectorized eager path (CPU unit tests, >128 batch, or CUDAGraph disabled)
+        max_vlen = max(len(t) for t in decode_toks)
+        s_eager = s_max
+        tok_pad = [r + [0] * (s_eager - len(r)) for r in decode_toks]
+        fc_idx_pad = [r + [zero_fc_idx] * (s_eager - len(r)) for r in decode_fc_src]
+
+        slot_gpu = torch.tensor(decode_slots, dtype=torch.long, device=self.device)
+        vlen_gpu = torch.tensor(
+            [len(r) for r in decode_toks], dtype=torch.long, device=self.device
+        )
+        prev2_gpu = torch.tensor(decode_prev2, dtype=torch.long, device=self.device)
+        tok_gpu = torch.tensor(tok_pad, dtype=torch.long, device=self.device)
+        fc_idx_gpu = torch.tensor(
+            fc_idx_pad, dtype=torch.long, device=self.device
+        ).reshape(-1)
+        prev_fc_gpu = fc_sources.index_select(0, fc_idx_gpu).view(
+            decode_count, s_eager, pool.d_model
+        )
+
+        state_cache = pool.gather_drafter_state_cache(
+            slot_gpu, include_nu=self._want_nu_state
+        ).to(self._state_cache_dtype)
+
+        temps_eager: Tensor | None = None
+        if is_stoch:
+            if temps_cpu_list is not None:
+                temps_eager = torch.tensor(
+                    temps_cpu_list, dtype=torch.float32, device=self.device
+                )
+            elif temps_gpu_vec is not None:
+                temps_eager = temps_gpu_vec
+
+        start_k = 0 if drafter.config.sample_from_anchor else 1
+        if self.use_kraus_tree and hasattr(drafter, "draft_kraus_tree_step"):
+            tree_kw: dict[str, Any] = {
+                "tree_budget": self.tree_budget,
+                "branch_width": self.branch_width,
+                "temperature": (0.6 if is_stoch else 0.0),
+            }
+            tree_params = inspect.signature(drafter.draft_kraus_tree_step).parameters
+            if "return_q_probs" in tree_params:
+                tree_kw["return_q_probs"] = False
+            if "prev_context_ids" in tree_params:
+                tree_kw["prev_context_ids"] = prev2_gpu
+            tree_dict, updated_cache = drafter.draft_kraus_tree_step(
+                prev_fc_gpu, tok_gpu, vlen_gpu, state_cache, **tree_kw
+            )
+            prop_ids, prop_conf = self._extract_kraus_tree_spine_static(
+                tree_dict, k_out
+            )
+            details = {
+                k_d: tree_dict[k_d]
+                for k_d in ("purity", "p_vac")
+                if k_d in tree_dict
+            }
+        elif self._supports_fast_v3_decode:
+            draft_ids, updated_cache, details = drafter.advance_and_draft_step(
+                prev_fc_gpu,
+                tok_gpu,
+                vlen_gpu,
+                state_cache,
+                temperature=(1.0 if is_stoch else 0.0),
+                return_details=True,
+                prev_context_ids=prev2_gpu,
+                temperatures_tensor=temps_eager,
+                include_draft_probs=False,
+            )
+            prop_ids = draft_ids[:, start_k:]
+            prop_conf = details["confidences"][:, start_k:].to(torch.float32)
+        else:
+            draft_ids, updated_cache, details = self._invoke_advance_and_draft(
+                prev_fc_gpu, tok_gpu, vlen_gpu, state_cache, temperature=0.0
+            )
+            prop_ids = draft_ids[:, start_k:]
+            prop_conf = details["confidences"][:, start_k:].to(torch.float32)
+
+        pool.scatter_drafter_state_cache(slot_gpu, updated_cache)
+        pur_detail, vac_detail, _ = self._extract_aligned_quantum_details(
+            details, int(drafter.block_size), start_k
+        )
+        born_calibrated = (not self.use_kraus_tree) and (
+            getattr(drafter, "born_confidence_head", None) is not None
+        )
+        eff_cap = min(max_spec_cap, prop_ids.size(1))
+        eager_eff_batch = (
+            self._select_cg_bucket(decode_count)
+            if decode_count <= _MAX_CUDAGRAPH_BATCH
+            else len(req_ids)
+        )
+        horizons_t = self.scheduler.select_horizon_tensor(
+            confidences=prop_conf[:, :eff_cap],
+            active_batch_size=eager_eff_batch,
+            purity=None
+            if born_calibrated
+            else (
+                pur_detail[:, :eff_cap]
+                if (pur_detail is not None and pur_detail.ndim == _RANK_2D)
+                else pur_detail
+            ),
+            p_vac=None
+            if born_calibrated
+            else (
+                vac_detail[:, :eff_cap]
+                if (vac_detail is not None and vac_detail.ndim == _RANK_2D)
+                else vac_detail
+            ),
+            temperature=0.0,
+            temperatures_tensor=temps_eager,
+        ).clamp(min=1, max=eff_cap)
+
+        horizons_list = horizons_t.detach().cpu().tolist()
+        prop_rows = prop_ids[:, :eff_cap].detach().cpu().tolist()
+        for pos_i, row, k_req in zip(
+            decode_positions, prop_rows, horizons_list, strict=True
+        ):
+            k_final = eff_cap if preserve_vllm_full_cg else int(k_req)
+            proposals[pos_i] = row[:k_final]
         return proposals
+
+    @torch.no_grad()
+    def prepare_async_sampled_tokens(
+        self,
+        runner: Any,
+        sampled_token_ids_gpu: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Compute ``(next_token_ids, valid_sampled_tokens_count)`` on GPU (0 syncs).
+
+        Satisfies ``GPUModelRunner._copy_valid_sampled_token_count`` for
+        ``use_async_scheduling=True`` speculative execution without blocking the CPU.
+        """
+        input_batch = runner.input_batch
+        num_reqs, num_cols = sampled_token_ids_gpu.shape
+        dev = sampled_token_ids_gpu.device
+        vocab_size = int(getattr(input_batch, "vocab_size", 1 << 30))
+
+        discard_mask_obj = getattr(runner, "discard_request_mask", None)
+        discard_gpu = getattr(discard_mask_obj, "gpu", None)
+        discard_np = getattr(discard_mask_obj, "np", None)
+
+        is_valid = (sampled_token_ids_gpu >= 0) & (sampled_token_ids_gpu < vocab_size)
+        if isinstance(discard_gpu, Tensor):
+            keep_row = ~discard_gpu[:num_reqs].to(device=dev, dtype=torch.bool)
+            is_valid = is_valid & keep_row.unsqueeze(1)
+
+        valid_counts = is_valid.sum(dim=1, dtype=torch.int32)
+        col_offs = torch.arange(num_cols, device=dev, dtype=torch.long).unsqueeze(0)
+        last_col = torch.where(is_valid, col_offs, -1).max(dim=1).values.clamp_min(0)
+        next_tok = (
+            sampled_token_ids_gpu.gather(1, last_col.unsqueeze(1))
+            .squeeze(1)
+            .to(torch.int32)
+        )
+
+        any_discarded = (
+            bool(discard_np[:num_reqs].any())
+            if (discard_np is not None and num_reqs > 0)
+            else False
+        )
+        if any_discarded:
+            requests_map = getattr(runner, "requests", None) or {}
+            req_ids = list(input_batch.req_ids)
+            no_spec = getattr(input_batch, "num_tokens_no_spec", None)
+            backups: list[int] = []
+            for idx_r in range(num_reqs):
+                rid = req_ids[idx_r] if idx_r < len(req_ids) else ""
+                req_st = requests_map.get(rid)
+                pos_prev = (
+                    max(0, int(no_spec[idx_r]) - 1) if no_spec is not None else 0
+                )
+                if req_st is not None and hasattr(req_st, "get_token_id"):
+                    backups.append(int(req_st.get_token_id(pos_prev)))
+                else:
+                    backups.append(0)
+            backup_gpu = torch.tensor(backups, dtype=torch.int32, device=dev)
+            next_tok = torch.where(valid_counts > 0, next_tok, backup_gpu)
+
+        return next_tok, valid_counts
+
+    @torch.no_grad()
+    def propose_vllm_async_gpu_step(  # noqa: C901
+        self,
+        runner: Any,
+        scheduler_output: Any,
+        sampled_token_ids_gpu: Tensor,
+        next_token_ids_gpu: Tensor,
+        valid_counts_gpu: Tensor,
+        aux_hidden_states: list[Tensor] | None,
+        sampling_metadata: Any = None,
+    ) -> Tensor:
+        """Zero-CPU-sync GPU proposal step for ``vLLM V1`` ``async_scheduling=True``.
+
+        Consumes ``sampler_output.sampled_token_ids`` and ``valid_counts_gpu`` directly
+        on GPU and returns ``[num_reqs, k_sched]`` ``int64`` on ``self.device`` so
+        ``GPUModelRunner`` overlaps EngineCore scheduling/IPC with GPU execution.
+        """
+        del next_token_ids_gpu
+        drafter = self._require_drafter()
+        pool = self._require_slot_pool()
+        if self.scheduler is None:
+            raise RuntimeError("Amdahl scheduler is not initialized.")
+
+        finished = getattr(scheduler_output, "finished_req_ids", None) or ()
+        if finished:
+            self.free_finished_requests(list(finished))
+
+        input_batch = runner.input_batch
+        req_ids: list[str] = list(input_batch.req_ids)
+        num_reqs = len(req_ids)
+        k_out = (
+            int(drafter.block_size)
+            if drafter.config.sample_from_anchor
+            else max(1, int(drafter.block_size) - 1)
+        )
+        max_spec_cap = (
+            min(k_out, self._max_vllm_spec_tokens)
+            if self._max_vllm_spec_tokens is not None
+            else k_out
+        )
+        sched_k_raw = getattr(scheduler_output, "num_spec_tokens_to_schedule", None)
+        k_sched = (
+            min(max_spec_cap, int(sched_k_raw))
+            if sched_k_raw is not None
+            else max_spec_cap
+        )
+        if num_reqs == 0 or not aux_hidden_states or k_sched < 0:
+            return torch.zeros(
+                (num_reqs, max(0, k_sched)), dtype=torch.long, device=self.device
+            )
+
+        active_set = set(req_ids)
+        if pool.num_active_requests > 0:
+            stale = [rid for rid in pool.active_request_ids() if rid not in active_set]
+            if stale:
+                self.preempt_requests(stale)
+
+        num_scheduled_map: dict[str, int] = getattr(
+            scheduler_output, "num_scheduled_tokens", {}
+        )
+        spec_sched_map: dict[str, Any] = (
+            getattr(scheduler_output, "scheduled_spec_decode_tokens", None) or {}
+        )
+        total_sched = int(
+            getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0
+        )
+        if total_sched <= 0 and num_scheduled_map:
+            total_sched = sum(int(num_scheduled_map.get(r, 1)) for r in req_ids)
+
+        sliced_aux: Tensor | list[Tensor]
+        if total_sched > 0:
+            sliced_aux = (
+                [h[:total_sched] for h in aux_hidden_states]
+                if isinstance(aux_hidden_states, (list, tuple))
+                else aux_hidden_states[:total_sched]
+            )
+        else:
+            sliced_aux = aux_hidden_states
+
+        fc_flat = self.extract_fc_hidden(sliced_aux, already_projected=False)
+        n_total_fc = int(fc_flat.size(0))
+        pool_base = n_total_fc
+        zero_fc_idx = pool_base + int(pool.last_fc_pool.size(0))
+
+        token_ids_cpu = input_batch.token_ids_cpu
+        num_prompt_arr = getattr(input_batch, "num_prompt_tokens", None)
+        num_comp_arr = getattr(input_batch, "num_computed_tokens_cpu", None)
+        discard_mask_obj = getattr(runner, "discard_request_mask", None)
+        discard_np = getattr(discard_mask_obj, "np", None)
+
+        s_max = int(drafter.block_size) + 1
+        prefill_queue: list[tuple[str, int, list[int], Tensor, bool]] = []
+        case2_last2_updates: list[tuple[int, int, int, int]] = []
+
+        decode_positions: list[int] = []
+        decode_slots: list[int] = []
+        decode_is_case3: list[bool] = []
+        decode_c_starts: list[int] = []
+        decode_n_scheds: list[int] = []
+        decode_case2_first_src: list[int] = []
+        max_possible_vlen = 1
+
+        cursor = 0
+        for b_idx, rid in enumerate(req_ids):
+            n_sched = int(num_scheduled_map.get(rid, 1))
+            c_start = cursor
+            cursor += n_sched
+            is_discarded = (
+                bool(discard_np[b_idx]) if discard_np is not None else False
+            )
+            n_spec_r = len(spec_sched_map.get(rid, ()))
+            tok_row = token_ids_cpu[b_idx]
+            row_cap = len(tok_row)
+
+            num_comp = (
+                int(num_comp_arr[b_idx])
+                if num_comp_arr is not None
+                else (
+                    pool.get_seq_len(pool.get_slot(rid))
+                    if pool.has_request(rid)
+                    else 0
+                )
+            )
+            prompt_len = (
+                int(num_prompt_arr[b_idx])
+                if num_prompt_arr is not None
+                else (num_comp + n_sched)
+            )
+
+            if not pool.has_request(rid) and pool.is_preempted(rid):
+                saved = pool.get_preempted_state(rid)
+                recomp_prior = num_comp + n_sched
+                if (
+                    saved is not None
+                    and not is_discarded
+                    and n_sched == 1
+                    and recomp_prior == saved.seq_len
+                    and saved.seq_len > 1
+                    and saved.prompt_committed
+                ):
+                    pool.get_or_allocate_slot(rid)
+                else:
+                    pool.free_request(rid)
+
+            # Case 1: Intermediate chunked prefill (no token sampled on this step)
+            if is_discarded:
+                slot_idx, is_new = pool.get_or_allocate_slot(rid)
+                c_len = min(n_sched, max(0, n_total_fc - c_start))
+                chunk_end = min(row_cap, num_comp + c_len)
+                chunk_start = max(0, chunk_end - c_len)
+                if is_new and chunk_start > 0:
+                    restored_c1 = 0
+                    if self.apc_cache is not None:
+                        p_toks = [int(t) for t in tok_row[:chunk_start]]
+                        restored_c1, p_hash, _ = (
+                            self.apc_cache.match_and_restore_prefix(
+                                p_toks,
+                                slot_pool=pool,
+                                slot_idx=slot_idx,
+                                require_uncomputed_tail=False,
+                            )
+                        )
+                        if restored_c1 > 0:
+                            self._req_APC_parent_hash[rid] = p_hash
+                    if restored_c1 < chunk_start:
+                        pool.set_slot_meta(
+                            slot_idx, seq_len=chunk_start, has_last_fc=False
+                        )
+                        p0_s = (
+                            int(tok_row[chunk_start - 2])
+                            if chunk_start >= _PREV2_MIN_POS
+                            else 0
+                        )
+                        p1_s = int(tok_row[chunk_start - 1]) if chunk_start >= 1 else 0
+                        pool.advance_slot_last2_tokens(slot_idx, [p0_s, p1_s])
+                if c_len > 0 and chunk_end > chunk_start:
+                    chunk_toks = [int(t) for t in tok_row[chunk_start:chunk_end]]
+                    prefill_queue.append(
+                        (
+                            rid,
+                            slot_idx,
+                            chunk_toks,
+                            fc_flat[c_start : c_start + len(chunk_toks)],
+                            bool(is_new and chunk_start == 0),
+                        )
+                    )
+                continue
+
+            slot_idx, is_new = pool.get_or_allocate_slot(rid)
+
+            # Case 3: Steady-state speculative decode verification step
+            if (
+                not is_new
+                and pool.is_prompt_committed(slot_idx)
+                and (num_comp >= prompt_len or prompt_len == 0)
+            ):
+                avail_fc = max(0, n_total_fc - c_start)
+                if avail_fc <= 0:
+                    continue
+                upper_v = min(n_sched, avail_fc, s_max)
+                max_possible_vlen = max(max_possible_vlen, upper_v)
+                next_seq = (num_comp + 2) if n_sched == 1 else -1
+                pool.set_slot_meta(slot_idx, seq_len=next_seq, has_last_fc=False)
+                decode_positions.append(b_idx)
+                decode_slots.append(slot_idx)
+                decode_is_case3.append(True)
+                decode_c_starts.append(c_start)
+                decode_n_scheds.append(min(n_sched, avail_fc))
+                decode_case2_first_src.append(zero_fc_idx)
+                continue
+
+            # Case 2: Final prefill / prefix-cache hit / RECOMPUTE -> Step-0 decode
+            eff_p = (
+                max(prompt_len, num_comp + n_sched)
+                if n_spec_r == 0
+                else prompt_len
+            )
+            eff_p = min(eff_p, row_cap)
+            seq_committed = pool.get_seq_len(slot_idx)
+            if seq_committed > eff_p:
+                pool.reset_slot(slot_idx)
+                self._req_APC_parent_hash.pop(rid, None)
+                seq_committed = 0
+                is_new = True
+
+            if eff_p > 0 and seq_committed < eff_p:
+                avail_fc = max(0, n_total_fc - c_start)
+                n_pf_fc = min(n_sched, avail_fc, eff_p - seq_committed)
+                if n_pf_fc > 0:
+                    if is_new and n_pf_fc == eff_p:
+                        pf_toks = [int(t) for t in tok_row[:eff_p]]
+                        prefill_queue.append(
+                            (
+                                rid,
+                                slot_idx,
+                                pf_toks,
+                                fc_flat[c_start : c_start + n_pf_fc],
+                                True,
+                            )
+                        )
+                    elif is_new and n_pf_fc < eff_p:
+                        prefix_skip = eff_p - n_pf_fc
+                        restored = 0
+                        if self.apc_cache is not None:
+                            prefix_toks = [int(t) for t in tok_row[:prefix_skip]]
+                            restored, p_hash, _ = (
+                                self.apc_cache.match_and_restore_prefix(
+                                    prefix_toks,
+                                    slot_pool=pool,
+                                    slot_idx=slot_idx,
+                                    require_uncomputed_tail=False,
+                                )
+                            )
+                            if restored > 0:
+                                self._req_APC_parent_hash[rid] = p_hash
+                        if restored < prefix_skip:
+                            pool.set_slot_meta(
+                                slot_idx, seq_len=prefix_skip, has_last_fc=False
+                            )
+                        suf_toks = [int(t) for t in tok_row[prefix_skip:eff_p]]
+                        prefill_queue.append(
+                            (
+                                rid,
+                                slot_idx,
+                                suf_toks,
+                                fc_flat[c_start : c_start + n_pf_fc],
+                                False,
+                            )
+                        )
+                    else:
+                        cont_start = eff_p - n_pf_fc
+                        cont_toks = [int(t) for t in tok_row[cont_start:eff_p]]
+                        prefill_queue.append(
+                            (
+                                rid,
+                                slot_idx,
+                                cont_toks,
+                                fc_flat[c_start : c_start + n_pf_fc],
+                                False,
+                            )
+                        )
+
+            p0_pf = (
+                max(0, int(tok_row[eff_p - 2])) if eff_p >= _PREV2_MIN_POS else 0
+            )
+            p1_pf = max(0, int(tok_row[eff_p - 1])) if eff_p >= 1 else 0
+            case2_last2_updates.append((slot_idx, p0_pf, p1_pf, eff_p + 1))
+
+            upper_v0 = min(max(1, 1 + n_spec_r), s_max)
+            max_possible_vlen = max(max_possible_vlen, upper_v0)
+            first_src = (pool_base + slot_idx) if eff_p > 0 else zero_fc_idx
+            decode_positions.append(b_idx)
+            decode_slots.append(slot_idx)
+            decode_is_case3.append(False)
+            decode_c_starts.append(0)
+            decode_n_scheds.append(1)
+            decode_case2_first_src.append(first_src)
+
+        if prefill_queue:
+            self._prefill_requests_batched(prefill_queue)
+
+        if case2_last2_updates:
+            c2_slots = torch.tensor(
+                [u[0] for u in case2_last2_updates],
+                dtype=torch.long,
+                device=self.device,
+            )
+            c2_pairs = torch.tensor(
+                [[u[1], u[2]] for u in case2_last2_updates],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            pool.last2_tokens_pool.index_copy_(0, c2_slots, c2_pairs)
+            for slot_i, _, _, post_len in case2_last2_updates:
+                pool.set_slot_meta(
+                    slot_i,
+                    seq_len=post_len,
+                    has_last_fc=False,
+                )
+                pool.set_prompt_committed(slot_i, True)
+
+        decode_count = len(decode_slots)
+        if decode_count == 0 or k_sched == 0:
+            return torch.zeros(
+                (num_reqs, max(0, k_sched)), dtype=torch.long, device=self.device
+            )
+
+        if self._zero_fc_row is None:
+            raise RuntimeError("Zero fc row is not initialized.")
+        fc_sources = torch.cat([fc_flat, pool.last_fc_pool, self._zero_fc_row], dim=0)
+
+        is_stoch, temps_cpu_list, temps_gpu_vec = self._resolve_step_temperatures(
+            input_batch=input_batch,
+            req_ids=req_ids,
+            decode_batch_positions=decode_positions,
+            sampling_metadata=sampling_metadata,
+        )
+        decode_is_identity = (
+            decode_count == num_reqs
+            and decode_positions == list(range(num_reqs))
+        )
+
+        # Fast zero-sync CUDA-Graph GPU decode path
+        if (
+            self._cg_enabled
+            and decode_count <= _MAX_CUDAGRAPH_BATCH
+            and not (
+                self.device.type == "cuda"
+                and torch.cuda.is_current_stream_capturing()
+            )
+        ):
+            (
+                cg_slot_idx,
+                cg_prev_fc,
+                cg_token_ids,
+                cg_valid_lens,
+                _,
+                cg_temps,
+                _,
+                cg_out_i64,
+                _,
+                cg_meta_cpu,
+                cg_meta_gpu,
+                cg_temps_cpu,
+            ) = self._require_cg_buffers()
+
+            b_bucket = self._select_cg_bucket(decode_count)
+            s_bucket = min(4, s_max) if max_possible_vlen <= min(4, s_max) else s_max
+
+            graph = self._get_or_capture_decode_graph(
+                b_bucket=b_bucket,
+                s_bucket=s_bucket,
+                is_stochastic=is_stoch,
+                run_tree=self.use_kraus_tree,
+                max_spec_cap=max_spec_cap,
+                compute_prev2_from_pool=True,
+            )
+
+            meta_cols_used = 4 + s_bucket
+            scratch_base = pool.scratch_slot_base
+            rows_async: list[list[int]] = []
+            case3_local_rows: list[int] = []
+            for r_idx in range(decode_count):
+                slot_r = decode_slots[r_idx]
+                pos_r = decode_positions[r_idx]
+                if decode_is_case3[r_idx]:
+                    case3_local_rows.append(r_idx)
+                    cs_r = decode_c_starts[r_idx]
+                    ns_r = decode_n_scheds[r_idx]
+                    fcs_r = [
+                        (cs_r + j) if j < ns_r else zero_fc_idx
+                        for j in range(s_bucket)
+                    ]
+                    rows_async.append([slot_r, pos_r, 1, cs_r, *fcs_r])
+                else:
+                    f0 = decode_case2_first_src[r_idx]
+                    fcs_r = [f0] + [zero_fc_idx] * (s_bucket - 1)
+                    rows_async.append([slot_r, pos_r, 0, 0, *fcs_r])
+
+            pad_fc_cols = [zero_fc_idx] * s_bucket
+            for r_idx in range(decode_count, b_bucket):
+                rows_async.append([scratch_base + r_idx, 0, 0, 0, *pad_fc_cols])
+
+            meta_view_cpu = cg_meta_cpu[:b_bucket, :meta_cols_used]
+            meta_view_cpu.copy_(torch.tensor(rows_async, dtype=torch.long))
+            meta_view_gpu = cg_meta_gpu[:b_bucket, :meta_cols_used]
+            meta_view_gpu.copy_(meta_view_cpu, non_blocking=True)
+
+            slot_col = meta_view_gpu[:, 0]
+            pos_col = meta_view_gpu[:decode_count, 1]
+            cg_slot_idx[:b_bucket].copy_(slot_col)
+
+            vlen_dec = (
+                valid_counts_gpu.index_select(0, pos_col)
+                .to(torch.long)
+                .clamp(1, s_bucket)
+            )
+            cg_valid_lens[:decode_count].copy_(vlen_dec)
+            if b_bucket > decode_count:
+                cg_valid_lens[decode_count:b_bucket].fill_(1)
+
+            samp_dec = sampled_token_ids_gpu.index_select(0, pos_col)
+            n_copy_cols = min(s_bucket, int(samp_dec.size(1)))
+            cg_token_ids[:b_bucket, :s_bucket].zero_()
+            cg_token_ids[:decode_count, :n_copy_cols].copy_(
+                samp_dec[:, :n_copy_cols].clamp_min(0).to(torch.long)
+            )
+
+            fc_idx_flat = meta_view_gpu[:, 4:meta_cols_used].reshape(-1)
+            gathered_fc = fc_sources.index_select(0, fc_idx_flat).view(
+                b_bucket, s_bucket, pool.d_model
+            )
+            cg_prev_fc[:b_bucket, :s_bucket, :].copy_(gathered_fc)
+
+            if case3_local_rows and n_total_fc > 0:
+                if len(case3_local_rows) == decode_count:
+                    cstart_c3 = meta_view_gpu[:decode_count, 3]
+                    src_last = (cstart_c3 + vlen_dec - 1).clamp(0, n_total_fc - 1)
+                    pool.last_fc_pool.index_copy_(
+                        0, slot_col[:decode_count], fc_flat.index_select(0, src_last)
+                    )
+                else:
+                    c3_idx = torch.tensor(
+                        case3_local_rows, dtype=torch.long, device=self.device
+                    )
+                    cstart_c3 = meta_view_gpu[:decode_count, 3].index_select(0, c3_idx)
+                    vlen_c3 = vlen_dec.index_select(0, c3_idx)
+                    slots_c3 = slot_col[:decode_count].index_select(0, c3_idx)
+                    src_last = (cstart_c3 + vlen_c3 - 1).clamp(0, n_total_fc - 1)
+                    pool.last_fc_pool.index_copy_(
+                        0, slots_c3, fc_flat.index_select(0, src_last)
+                    )
+
+            if is_stoch:
+                if temps_cpu_list is not None:
+                    padded_t = temps_cpu_list + [0.0] * (b_bucket - decode_count)
+                    t_cpu = cg_temps_cpu[:b_bucket]
+                    t_cpu.copy_(torch.tensor(padded_t, dtype=torch.float32))
+                    cg_temps[:b_bucket].copy_(t_cpu, non_blocking=True)
+                elif temps_gpu_vec is not None:
+                    cg_temps[:decode_count].copy_(temps_gpu_vec)
+                    if b_bucket > decode_count:
+                        cg_temps[decode_count:b_bucket].zero_()
+
+            graph.replay()
+
+            draft_slice = cg_out_i64[:decode_count, 1 : 1 + k_sched]
+            if decode_is_identity:
+                return draft_slice.clone()
+            out_full = torch.zeros(
+                (num_reqs, k_sched), dtype=torch.long, device=self.device
+            )
+            out_full.index_copy_(0, pos_col, draft_slice)
+            return out_full
+
+        # Vectorized eager async fallback (CPU tests, >128 batch, or CUDAGraph disabled)
+        s_eager = s_max
+        pos_gpu = torch.tensor(decode_positions, dtype=torch.long, device=self.device)
+        slot_gpu = torch.tensor(decode_slots, dtype=torch.long, device=self.device)
+        vlen_gpu = (
+            valid_counts_gpu.index_select(0, pos_gpu)
+            .to(torch.long)
+            .clamp(1, s_eager)
+        )
+        samp_dec_e = sampled_token_ids_gpu.index_select(0, pos_gpu)
+        tok_gpu = torch.zeros(
+            (decode_count, s_eager), dtype=torch.long, device=self.device
+        )
+        n_cols_e = min(s_eager, int(samp_dec_e.size(1)))
+        tok_gpu[:, :n_cols_e] = samp_dec_e[:, :n_cols_e].clamp_min(0).to(torch.long)
+
+        fc_rows_e: list[list[int]] = []
+        c3_rows_e: list[int] = []
+        for r_idx in range(decode_count):
+            if decode_is_case3[r_idx]:
+                c3_rows_e.append(r_idx)
+                cs_r = decode_c_starts[r_idx]
+                ns_r = decode_n_scheds[r_idx]
+                fc_rows_e.append(
+                    [(cs_r + j) if j < ns_r else zero_fc_idx for j in range(s_eager)]
+                )
+            else:
+                f0 = decode_case2_first_src[r_idx]
+                fc_rows_e.append([f0] + [zero_fc_idx] * (s_eager - 1))
+
+        fc_idx_gpu = torch.tensor(
+            fc_rows_e, dtype=torch.long, device=self.device
+        ).reshape(-1)
+        prev_fc_gpu = fc_sources.index_select(0, fc_idx_gpu).view(
+            decode_count, s_eager, pool.d_model
+        )
+        if c3_rows_e and n_total_fc > 0:
+            c3_t = torch.tensor(c3_rows_e, dtype=torch.long, device=self.device)
+            cs_t = torch.tensor(
+                [decode_c_starts[i] for i in c3_rows_e],
+                dtype=torch.long,
+                device=self.device,
+            )
+            src_last_e = (cs_t + vlen_gpu.index_select(0, c3_t) - 1).clamp(
+                0, n_total_fc - 1
+            )
+            pool.last_fc_pool.index_copy_(
+                0, slot_gpu.index_select(0, c3_t), fc_flat.index_select(0, src_last_e)
+            )
+
+        pool_last2_e = pool.last2_tokens_pool.index_select(0, slot_gpu)
+        w_tok_e = torch.cat([pool_last2_e, tok_gpu], dim=1)
+        p0_e = w_tok_e.gather(1, (vlen_gpu - 1).unsqueeze(1))
+        p1_e = w_tok_e.gather(1, vlen_gpu.unsqueeze(1))
+        prev2_gpu = torch.cat([p0_e, p1_e], dim=1)
+        last_e = w_tok_e.gather(1, (vlen_gpu + 1).unsqueeze(1))
+        pool.last2_tokens_pool.index_copy_(
+            0, slot_gpu, torch.cat([p1_e, last_e], dim=1)
+        )
+
+        state_cache = pool.gather_drafter_state_cache(
+            slot_gpu, include_nu=self._want_nu_state
+        ).to(self._state_cache_dtype)
+        temps_eager: Tensor | None = None
+        if is_stoch:
+            if temps_cpu_list is not None:
+                temps_eager = torch.tensor(
+                    temps_cpu_list, dtype=torch.float32, device=self.device
+                )
+            elif temps_gpu_vec is not None:
+                temps_eager = temps_gpu_vec
+
+        start_k = 0 if drafter.config.sample_from_anchor else 1
+        if self.use_kraus_tree and hasattr(drafter, "draft_kraus_tree_step"):
+            tree_kw: dict[str, Any] = {
+                "tree_budget": self.tree_budget,
+                "branch_width": self.branch_width,
+                "temperature": (0.6 if is_stoch else 0.0),
+            }
+            tree_params = inspect.signature(drafter.draft_kraus_tree_step).parameters
+            if "return_q_probs" in tree_params:
+                tree_kw["return_q_probs"] = False
+            if "prev_context_ids" in tree_params:
+                tree_kw["prev_context_ids"] = prev2_gpu
+            tree_dict, updated_cache = drafter.draft_kraus_tree_step(
+                prev_fc_gpu, tok_gpu, vlen_gpu, state_cache, **tree_kw
+            )
+            prop_ids, _ = self._extract_kraus_tree_spine_static(tree_dict, k_out)
+        elif self._supports_fast_v3_decode:
+            draft_ids, updated_cache, _ = drafter.advance_and_draft_step(
+                prev_fc_gpu,
+                tok_gpu,
+                vlen_gpu,
+                state_cache,
+                temperature=(1.0 if is_stoch else 0.0),
+                return_details=True,
+                prev_context_ids=prev2_gpu,
+                temperatures_tensor=temps_eager,
+                include_draft_probs=False,
+            )
+            prop_ids = draft_ids[:, start_k:]
+        else:
+            draft_ids, updated_cache, _ = self._invoke_advance_and_draft(
+                prev_fc_gpu, tok_gpu, vlen_gpu, state_cache, temperature=0.0
+            )
+            prop_ids = draft_ids[:, start_k:]
+
+        pool.scatter_drafter_state_cache(slot_gpu, updated_cache)
+        draft_eager = prop_ids[:, :k_sched].to(torch.long)
+        if decode_is_identity:
+            return draft_eager.contiguous()
+        out_full_e = torch.zeros(
+            (num_reqs, k_sched), dtype=torch.long, device=self.device
+        )
+        out_full_e.index_copy_(0, pos_gpu, draft_eager)
+        return out_full_e
 
     def propose(
         self,

@@ -1384,6 +1384,7 @@ class KvNDSparkDraftModel(DSparkDraftModel):
         cur_prev_prev_id: Tensor | None,  # [B]
         cur_prev3_id: Tensor | None,  # [B]
         rnn_state: Tensor | None,  # [B, R]
+        precomputed_h_joint: Tensor | None = None,  # [B, 3*R]
     ) -> tuple[Tensor, Tensor | None, Tensor | None]:
         """Compute single-horizon (logits_k, p_emb_k, next_rnn_state) with MarkovHead +
         SpeculativeEngram.
@@ -1402,18 +1403,32 @@ class KvNDSparkDraftModel(DSparkDraftModel):
                 p_emb_k = p_emb_k + engram_delta.to(p_emb_k.dtype)
             w_dtype = self.markov_head.markov_w2.weight.dtype
             p_emb_cast = p_emb_k.to(w_dtype)
-            h_cast = h_k.to(w_dtype)
             if self.markov_head.head_type == "vanilla":
                 bias_k = self.markov_head.markov_w2(p_emb_cast)
             elif self.markov_head.head_type == "gated":
+                h_cast = h_k.to(w_dtype)
                 gate = torch.sigmoid(
                     self.markov_head.gate_proj(torch.cat([h_cast, p_emb_cast], dim=-1))
                 )
                 bias_k = self.markov_head.markov_w2(gate * p_emb_cast)
             else:
                 assert rnn_state is not None
-                z = torch.cat([rnn_state.to(w_dtype), p_emb_cast, h_cast], dim=-1)
-                g_raw, c_raw, o_raw = self.markov_head.joint_proj(z).chunk(3, dim=-1)
+                if precomputed_h_joint is not None and not torch.is_grad_enabled():
+                    r_dim = self.markov_head.markov_rank
+                    rp_cat = torch.cat([rnn_state.to(w_dtype), p_emb_cast], dim=-1)
+                    joint_out = (
+                        F.linear(
+                            rp_cat, self.markov_head.joint_proj.weight[:, : 2 * r_dim]
+                        )
+                        + precomputed_h_joint
+                    )
+                    g_raw, c_raw, o_raw = joint_out.chunk(3, dim=-1)
+                else:
+                    h_cast = h_k.to(w_dtype)
+                    z = torch.cat([rnn_state.to(w_dtype), p_emb_cast, h_cast], dim=-1)
+                    g_raw, c_raw, o_raw = self.markov_head.joint_proj(z).chunk(
+                        3, dim=-1
+                    )
                 gate = torch.sigmoid(g_raw)
                 rnn_state = gate * rnn_state.to(w_dtype) + (1.0 - gate) * torch.tanh(
                     c_raw
@@ -1442,7 +1457,9 @@ class KvNDSparkDraftModel(DSparkDraftModel):
         purity: Tensor | None = None,
         temperature: float = 0.0,
         prev_context_ids: Tensor | None = None,  # optional [B, <=2] prior tokens
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        temperatures_tensor: Tensor | None = None,  # optional [B] GPU float32
+        return_draft_probs: bool = True,
+    ) -> tuple[Tensor, Tensor, Tensor | None]:
         """Autoregressively decode K speculative tokens (greedy or stochastic) + Born
         confidence.
         """
@@ -1460,11 +1477,24 @@ class KvNDSparkDraftModel(DSparkDraftModel):
             cur_prev_prev_id = torch.zeros_like(cur_prev_id)
             cur_prev3_id = torch.zeros_like(cur_prev_id)
 
-        rnn_state = (
-            hidden_blocks.new_zeros(bsz, self.markov_head.markov_rank)
-            if (self.markov_head is not None and self.markov_head.head_type == "rnn")
-            else None
-        )
+        rnn_state: Tensor | None = None
+        h_joint_all: Tensor | None = None
+        if self.markov_head is not None and self.markov_head.head_type == "rnn":
+            r_dim = self.markov_head.markov_rank
+            rnn_state = hidden_blocks.new_zeros(bsz, r_dim)
+            if not torch.is_grad_enabled():
+                w_joint = self.markov_head.joint_proj.weight
+                b_joint = self.markov_head.joint_proj.bias
+                h_joint_all = F.linear(
+                    hidden_blocks.to(w_joint.dtype), w_joint[:, 2 * r_dim :], b_joint
+                )
+
+        temp_vec: Tensor | None = None
+        is_stoch_vec: Tensor | None = None
+        if temperatures_tensor is not None:
+            t_f = temperatures_tensor.to(device=dev, dtype=torch.float32).view(bsz, 1)
+            is_stoch_vec = t_f.squeeze(-1) > 1e-6
+            temp_vec = t_f.clamp_min(1e-5)
 
         drafted_target_ids: list[Tensor] = []
         draft_probs_list: list[Tensor] = []
@@ -1478,18 +1508,45 @@ class KvNDSparkDraftModel(DSparkDraftModel):
                 cur_prev_prev_id=cur_prev_prev_id,
                 cur_prev3_id=cur_prev3_id,
                 rnn_state=rnn_state,
+                precomputed_h_joint=(
+                    h_joint_all[:, k, :] if h_joint_all is not None else None
+                ),
             )
             if p_emb_k is not None:
                 prev_embs.append(p_emb_k)
 
-            if temperature > 0.0:
-                probs_k = torch.softmax(logits_k.float() / float(temperature), dim=-1)
-                draft_idx_k = torch.multinomial(probs_k, num_samples=1).squeeze(-1)
+            if temp_vec is not None and is_stoch_vec is not None:
+                scaled_logits = logits_k.float() / temp_vec
+                exp_noise = (
+                    torch.empty_like(scaled_logits).exponential_(1.0).clamp_min_(1e-12)
+                )
+                sampled_idx = (scaled_logits - exp_noise.log_()).argmax(dim=-1)
+                greedy_idx = logits_k.argmax(dim=-1)
+                draft_idx_k = torch.where(is_stoch_vec, sampled_idx, greedy_idx)
+                if return_draft_probs:
+                    draft_probs_list.append(torch.softmax(scaled_logits, dim=-1))
+            elif temperature > 0.0:
+                scaled_logits = logits_k.float() / float(temperature)
+                if logits_k.is_cuda and torch.cuda.is_current_stream_capturing():
+                    exp_noise = (
+                        torch.empty_like(scaled_logits)
+                        .exponential_(1.0)
+                        .clamp_min_(1e-12)
+                    )
+                    draft_idx_k = (scaled_logits - exp_noise.log_()).argmax(dim=-1)
+                    if return_draft_probs:
+                        draft_probs_list.append(torch.softmax(scaled_logits, dim=-1))
+                else:
+                    probs_k = torch.softmax(scaled_logits, dim=-1)
+                    draft_idx_k = torch.multinomial(probs_k, num_samples=1).squeeze(-1)
+                    if return_draft_probs:
+                        draft_probs_list.append(probs_k)
             else:
-                probs_k = torch.softmax(logits_k.float(), dim=-1)
                 draft_idx_k = logits_k.argmax(dim=-1)
+                if return_draft_probs:
+                    probs_k = torch.softmax(logits_k.float(), dim=-1)
+                    draft_probs_list.append(probs_k)
 
-            draft_probs_list.append(probs_k)
             target_id_k = self._map_draft_to_target_ids(draft_idx_k)
             drafted_target_ids.append(target_id_k)
 
@@ -1499,7 +1556,9 @@ class KvNDSparkDraftModel(DSparkDraftModel):
                 cur_prev_id = target_id_k
 
         draft_tokens = torch.stack(drafted_target_ids, dim=1)
-        draft_probs = torch.stack(draft_probs_list, dim=1)
+        draft_probs = (
+            torch.stack(draft_probs_list, dim=1) if return_draft_probs else None
+        )
         prev_emb_block = torch.stack(prev_embs, dim=1) if prev_embs else None
 
         if self.born_confidence_head is not None:
@@ -1701,8 +1760,11 @@ class KvNDSparkDraftModel(DSparkDraftModel):
         temperature: float = 0.0,
         return_details: bool = False,
         prev_context_ids: Tensor | None = None,
+        temperatures_tensor: Tensor | None = None,
+        include_draft_probs: bool = True,
     ):
         """Static-shape CUDA-Graph-compatible vLLM proposer step."""
+        need_probs = bool(return_details and include_draft_probs)
         (
             updated_cache,
             hidden_blocks,
@@ -1730,15 +1792,14 @@ class KvNDSparkDraftModel(DSparkDraftModel):
             purity=purity,
             temperature=temperature,
             prev_context_ids=prev_context_ids,
+            temperatures_tensor=temperatures_tensor,
+            return_draft_probs=need_probs,
         )
         if not return_details:
             return draft_tokens, conf_probs
 
         prefix_survival = torch.cumprod(conf_probs, dim=-1)
-        draft_entropy = -(draft_probs * draft_probs.clamp_min(1e-12).log()).sum(dim=-1)
-        details = {
-            "draft_probs": draft_probs,
-            "draft_entropy": draft_entropy,
+        details: dict[str, Tensor] = {
             "confidences": conf_probs,
             "prefix_survival": prefix_survival,
             "purity": purity.float().mean(dim=-1),
@@ -1746,6 +1807,12 @@ class KvNDSparkDraftModel(DSparkDraftModel):
             "mode_purity": purity.float(),
             "dyad_p_vac": p_vac.float(),
         }
+        if draft_probs is not None:
+            draft_entropy = -(
+                draft_probs * draft_probs.clamp_min(1e-12).log()
+            ).sum(dim=-1)
+            details["draft_probs"] = draft_probs
+            details["draft_entropy"] = draft_entropy
         return draft_tokens, updated_cache, details
 
     @torch.no_grad()
@@ -1759,19 +1826,11 @@ class KvNDSparkDraftModel(DSparkDraftModel):
         branch_width: int = 3,
         temperature: float = 0.0,
         reset_seq_mask: Tensor | None = None,
+        return_q_probs: bool = True,
+        prev_context_ids: Tensor | None = None,
     ) -> tuple[dict[str, Tensor], Tensor | dict[str, Tensor]]:
-        """Expand a SpecInfer-compatible speculative tree via diagonal Kraus POVM
-        back-action (Axe 5).
-
-        At each parent node u, evaluates active top-C diagonal Kraus operators
-        satisfying
-        ``sum_{y in C_k} M_y^dagger M_y = I_{M+1}`` identically, selects/samples up to
-        ``branch_width`` distinct sibling tokens without replacement (recording the
-        exact
-        sibling-conditioned proposal distribution ``tree_q_probs`` for lossless
-        SpecInfer
-        verification), and collapses child modal amplitudes ``(q_u, p_u)`` via Lüders
-        rule.
+        """Vectorized static-shape [B * W] SpecInfer tree expansion via diagonal Kraus
+        POVM back-action (Axe 5, CUDA-Graph-compatible, zero CPU-GPU syncs).
         """
         if tree_budget <= 0:
             raise ValueError(f"tree_budget must be > 0, got {tree_budget}.")
@@ -1795,280 +1854,553 @@ class KvNDSparkDraftModel(DSparkDraftModel):
         )
 
         bsz, k_horizons, v_draft = base_logits.shape
+        d_model = hidden_blocks.size(-1)
         dev = base_logits.device
         eff_w = max(1, min(branch_width, v_draft))
 
-        # Determine node allocation per depth so total expanded nodes == tree_budget
-        # If geometric tree sum_{k=0}^{K-1} eff_w^{k+1} < tree_budget, widen root/early
-        # branching
         max_geom = sum(eff_w ** (k + 1) for k in range(k_horizons))
         root_w = eff_w
         if max_geom < tree_budget and v_draft > eff_w:
             root_w = min(v_draft, max(eff_w, tree_budget))
+
+        # Precompute deterministic static level schedule (0 GPU syncs)
+        written_sim = 0
+        frontier_len_sim = 1
+        level_schedule: list[tuple[int, int, list[int]]] = []
+        for depth in range(k_horizons):
+            if written_sim >= tree_budget or frontier_len_sim <= 0:
+                break
+            width_here = root_w if depth == 0 else eff_w
+            reserve_spine = (
+                max(0, k_horizons - depth - 1) if tree_budget >= k_horizons else 0
+            )
+            level_limit = min(
+                tree_budget, max(written_sim + 1, tree_budget - reserve_spine)
+            )
+            w_start_d = written_sim
+            child_counts: list[int] = []
+            for _ in range(frontier_len_sim):
+                if written_sim >= level_limit:
+                    break
+                nc = min(width_here, level_limit - written_sim, v_draft)
+                if nc <= 0:
+                    break
+                child_counts.append(nc)
+                written_sim += nc
+            if not child_counts:
+                break
+            level_schedule.append((depth, w_start_d, child_counts))
+            frontier_len_sim = sum(child_counts)
 
         tree_draft_ids = torch.zeros((bsz, tree_budget), dtype=torch.long, device=dev)
         tree_parent_idx = torch.full(
             (bsz, tree_budget), -1, dtype=torch.long, device=dev
         )
         tree_depths = torch.zeros((bsz, tree_budget), dtype=torch.long, device=dev)
-        tree_q_probs = torch.zeros(
-            (bsz, tree_budget, v_draft), dtype=torch.float32, device=dev
+        tree_q_probs = (
+            torch.zeros((bsz, tree_budget, v_draft), dtype=torch.float32, device=dev)
+            if return_q_probs
+            else torch.empty((bsz, 0, 0), dtype=torch.float32, device=dev)
         )
         tree_token_probs = torch.zeros(
             (bsz, tree_budget), dtype=torch.float32, device=dev
         )
         tree_survival = torch.zeros((bsz, tree_budget), dtype=torch.float32, device=dev)
-        max_povm_err = torch.zeros((), dtype=torch.float32, device=dev)
-
-        # Per-batch expansion (bsz in speculative serving is small; keeps
-        # survival-ranked beam exact per req)
-        for b in range(bsz):
-            # Frontier entries: (node_idx, depth_next, prev_id, prev_prev_id, prev3_id,
-            # rnn_st, h_back, survival)
-            init_rnn = (
-                hidden_blocks.new_zeros((1, self.markov_head.markov_rank))
-                if (
-                    self.markov_head is not None and self.markov_head.head_type == "rnn"
-                )
-                else None
-            )
-            zero_id = torch.zeros((1,), dtype=torch.long, device=dev)
-            zero_back = torch.zeros(
-                (1, hidden_blocks.size(-1)),
-                dtype=hidden_blocks.dtype,
-                device=dev,
-            )
-
-            frontier: list[
-                tuple[int, int, Tensor, Tensor, Tensor, Tensor | None, Tensor, float]
-            ] = [
-                (
-                    -1,
-                    0,
-                    anchor_token_ids[b : b + 1].long(),
-                    zero_id,
-                    zero_id,
-                    init_rnn,
-                    zero_back,
-                    1.0,
-                )
-            ]
-            written = 0
-
-            for depth in range(k_horizons):
-                if written >= tree_budget or not frontier:
-                    break
-
-                # Sort frontier at current depth by descending cumulative survival
-                frontier.sort(key=lambda item: item[7], reverse=True)
-                next_frontier: list[
-                    tuple[
-                        int, int, Tensor, Tensor, Tensor, Tensor | None, Tensor, float
-                    ]
-                ] = []
-
-                h_base_d = hidden_blocks[b : b + 1, depth, :]
-                logits_base_d = base_logits[b : b + 1, depth, :]
-                q_base_d = q_obs[b : b + 1, depth, :]
-                p_base_d = p_obs[b : b + 1, depth, :]
-                born_d = born_obs[b : b + 1, depth : depth + 1, :]
-                pvac_d = p_vac[b : b + 1, depth : depth + 1, :]
-                pur_d = purity[b : b + 1, depth : depth + 1, :]
-
-                width_here = root_w if depth == 0 else eff_w
-                reserve_spine = (
-                    max(0, k_horizons - depth - 1) if tree_budget >= k_horizons else 0
-                )
-                level_limit = max(written + 1, tree_budget - reserve_spine)
-                level_limit = min(level_limit, tree_budget)
-
-                for (
-                    parent_node,
-                    _,
-                    prev_id,
-                    prev_prev_id,
-                    prev3_id,
-                    rnn_st,
-                    h_back,
-                    parent_surv,
-                ) in frontier:
-                    if written >= level_limit:
-                        break
-
-                    n_children = min(width_here, level_limit - written, v_draft)
-                    h_node = h_base_d + h_back
-                    if parent_node >= 0:
-                        # Add back-action logit shift from parent's Kraus measurement
-                        # collapse
-                        logits_in = logits_base_d + F.linear(
-                            h_back.to(self.lm_head.weight.dtype), self.lm_head.weight
-                        ).to(logits_base_d.dtype)
-                    else:
-                        logits_in = logits_base_d
-
-                    logits_u, p_emb_u, next_rnn_u = self._step_markov_and_engram_logits(
-                        base_logits_k=logits_in,
-                        h_k=h_node,
-                        cur_prev_id=prev_id,
-                        cur_prev_prev_id=prev_prev_id,
-                        cur_prev3_id=prev3_id,
-                        rnn_state=rnn_st,
-                    )
-
-                    # Evaluate diagonal Kraus POVM over active top-C candidates
-                    povm_diag_u: Tensor | None = None
-                    top_idx_u: Tensor | None = None
-                    if self.kraus_head is not None:
-                        eff_c = min(
-                            self.kraus_head.top_c,
-                            v_draft,
-                            max(n_children, self.kraus_head.top_c),
-                        )
-                        eff_c = min(eff_c, v_draft)
-                        top_idx_u = logits_u.topk(eff_c, dim=-1).indices  # [1, C]
-                        cand_logits = logits_u.gather(dim=-1, index=top_idx_u)
-                        cand_vecs = self.lm_head.weight.index_select(
-                            0, top_idx_u.view(-1)
-                        ).unsqueeze(0)
-                        _, povm_diag_u, _ = self.kraus_head.compute_povm(
-                            cand_logits, cand_vecs, q_base_d, p_base_d
-                        )
-                        comp_err = (povm_diag_u.sum(dim=-2) - 1.0).abs().max()
-                        max_povm_err = torch.maximum(max_povm_err, comp_err)
-
-                    # Node acceptance confidence
-                    if self.born_confidence_head is not None:
-                        conf_u = torch.sigmoid(
-                            self.born_confidence_head(
-                                hidden_blocks=h_node.unsqueeze(1),
-                                prev_emb=p_emb_u.unsqueeze(1)
-                                if (
-                                    p_emb_u is not None
-                                    and self.config.confidence_head_with_markov
-                                )
-                                else None,
-                                born_features=born_d,
-                                p_vac=pvac_d,
-                                purity=pur_d,
-                            ).float()
-                        ).item()
-                    else:
-                        conf_u = 1.0
-
-                    if temperature > 0.0:
-                        base_q = torch.softmax(
-                            logits_u[0].float() / float(temperature), dim=-1
-                        )
-                    else:
-                        base_q = torch.softmax(logits_u[0].float(), dim=-1)
-                        greedy_top = logits_u[0].topk(n_children, dim=-1).indices
-
-                    avail_mask = torch.ones_like(base_q)
-                    for r in range(n_children):
-                        masked_q = base_q * avail_mask
-                        mass = masked_q.sum()
-                        if float(mass.item()) <= 1e-12:
-                            q_r = avail_mask / avail_mask.sum().clamp_min(1.0)
-                        else:
-                            q_r = masked_q / mass
-
-                        if temperature > 0.0:
-                            draft_tok = int(
-                                torch.multinomial(q_r, num_samples=1).item()
-                            )
-                        else:
-                            draft_tok = int(greedy_top[r].item())
-
-                        avail_mask[draft_tok] = 0.0
-                        draft_tok_t = torch.tensor(
-                            [draft_tok], dtype=torch.long, device=dev
-                        )
-                        target_tok_t = self._map_draft_to_target_ids(draft_tok_t)
-                        tok_prob = float(q_r[draft_tok].item())
-                        child_surv = float(parent_surv * conf_u * max(tok_prob, 1e-4))
-
-                        node_idx = written
-                        written += 1
-                        tree_draft_ids[b, node_idx] = target_tok_t[0]
-                        tree_parent_idx[b, node_idx] = parent_node
-                        tree_depths[b, node_idx] = depth + 1
-                        tree_q_probs[b, node_idx] = q_r
-                        tree_token_probs[b, node_idx] = tok_prob
-                        tree_survival[b, node_idx] = child_surv
-
-                        # Compute Lüders-Kraus collapsed back-action for child depth + 1
-                        if (
-                            self.kraus_head is not None
-                            and povm_diag_u is not None
-                            and top_idx_u is not None
-                            and (depth + 1) < k_horizons
-                        ):
-                            match_pos = (top_idx_u[0] == draft_tok).nonzero(
-                                as_tuple=False
-                            )
-                            if match_pos.numel() > 0:
-                                c_pos = int(match_pos[0, 0].item())
-                                povm_row = povm_diag_u[:, c_pos, :]
-                            else:
-                                povm_row = torch.full(
-                                    (1, self.kraus_head.n_modes + 1),
-                                    1.0 / float(max(1, eff_c)),
-                                    dtype=torch.float32,
-                                    device=dev,
-                                )
-                            _, _, raw_h_back = self.kraus_head.collapse_branch_state(
-                                q_obs[b : b + 1, depth + 1, :],
-                                p_obs[b : b + 1, depth + 1, :],
-                                povm_row,
-                                hidden_blocks.dtype,
-                            )
-                            _, _, top1_h_back = self.kraus_head.collapse_branch_state(
-                                q_obs[b : b + 1, depth + 1, :],
-                                p_obs[b : b + 1, depth + 1, :],
-                                povm_diag_u[:, 0, :],
-                                hidden_blocks.dtype,
-                            )
-                            child_h_back = raw_h_back - top1_h_back
-                        else:
-                            child_h_back = zero_back
-
-                        if (depth + 1) < k_horizons:
-                            next_prev_id = (
-                                target_tok_t
-                                if self.config.sample_from_anchor
-                                else (prev_id if depth == 0 else target_tok_t)
-                            )
-                            next_frontier.append(
-                                (
-                                    node_idx,
-                                    depth + 1,
-                                    next_prev_id,
-                                    prev_id,
-                                    prev_prev_id,
-                                    next_rnn_u.clone()
-                                    if next_rnn_u is not None
-                                    else None,
-                                    child_h_back,
-                                    child_surv,
-                                )
-                            )
-
-                frontier = next_frontier
-
-        # Construct causal tree ancestor attention mask [B, tree_budget, tree_budget]
         tree_attn_mask = (
             torch.eye(tree_budget, dtype=torch.bool, device=dev)
             .unsqueeze(0)
             .expand(bsz, tree_budget, tree_budget)
             .clone()
         )
-        for b in range(bsz):
-            for i in range(tree_budget):
-                p_idx = int(tree_parent_idx[b, i].item())
-                if 0 <= p_idx < i:
-                    tree_attn_mask[b, i] = (
-                        tree_attn_mask[b, i] | tree_attn_mask[b, p_idx]
+        max_povm_err = torch.zeros((), dtype=torch.float32, device=dev)
+
+        has_rnn = (
+            self.markov_head is not None and self.markov_head.head_type == "rnn"
+        )
+        rnn_rank = (
+            self.markov_head.markov_rank
+            if has_rnn and self.markov_head is not None
+            else 0
+        )
+
+        # Batched frontier state across all B sequences: [B, F_d, ...]
+        f_node = torch.full((bsz, 1), -1, dtype=torch.long, device=dev)
+        f_prev_id = anchor_token_ids.long().view(bsz, 1)
+        if prev_context_ids is not None and prev_context_ids.size(-1) >= 1:
+            f_prev2_id = prev_context_ids[:, -1:].long().contiguous()
+            f_prev3_id = (
+                prev_context_ids[:, -2:-1].long().contiguous()
+                if prev_context_ids.size(-1) >= 2
+                else torch.zeros((bsz, 1), dtype=torch.long, device=dev)
+            )
+        else:
+            f_prev2_id = torch.zeros((bsz, 1), dtype=torch.long, device=dev)
+            f_prev3_id = torch.zeros((bsz, 1), dtype=torch.long, device=dev)
+        f_rnn = (
+            hidden_blocks.new_zeros((bsz, 1, rnn_rank))
+            if has_rnn
+            else None
+        )
+        h_joint_all: Tensor | None = None
+        if has_rnn and self.markov_head is not None and not torch.is_grad_enabled():
+            w_joint = self.markov_head.joint_proj.weight
+            b_joint = self.markov_head.joint_proj.bias
+            h_joint_all = F.linear(
+                hidden_blocks.to(w_joint.dtype), w_joint[:, 2 * rnn_rank :], b_joint
+            )
+        two_m_back = 2 * self.kraus_head.n_modes if self.kraus_head is not None else 1
+        f_qp_back = torch.zeros(
+            (bsz, 1, two_m_back), dtype=hidden_blocks.dtype, device=dev
+        )
+        f_surv = torch.ones((bsz, 1), dtype=torch.float32, device=dev)
+        prev_h_back_is_zero = True
+
+        num_sched = len(level_schedule)
+        spine_start_sched = num_sched
+        if temperature <= 0.0 and not return_q_probs:
+            while spine_start_sched > 0:
+                _, _, cc_prev = level_schedule[spine_start_sched - 1]
+                if len(cc_prev) == 1 and sum(cc_prev) == 1:
+                    spine_start_sched -= 1
+                else:
+                    break
+
+        deferred_depths: list[int] = []
+        deferred_w_starts: list[int] = []
+        deferred_h: list[Tensor] = []
+        deferred_pemb: list[Tensor] = []
+        deferred_logits: list[Tensor] = []
+        deferred_draft: list[Tensor] = []
+        spine_entry_surv: Tensor | None = None
+
+        for sched_idx, (depth, w_start, child_counts) in enumerate(level_schedule):
+            p_d = len(child_counts)
+            w_max = max(child_counts)
+            n_d = sum(child_counts)
+            w_end = w_start + n_d
+            bp = bsz * p_d
+            defer_this_spine = sched_idx >= spine_start_sched
+
+            if f_surv.size(1) == 1 and p_d == 1:
+                p_node = f_node
+                p_prev_id = f_prev_id
+                p_prev2_id = f_prev2_id
+                p_prev3_id = f_prev3_id
+                p_rnn = f_rnn
+                p_qp_back = f_qp_back
+                p_surv = f_surv
+            else:
+                # Stable descending sort matches Python Timsort tie-breaking bit-for-bit
+                top_p = torch.argsort(-f_surv, dim=1, stable=True)[:, :p_d]
+                p_node = f_node.gather(1, top_p)
+                p_prev_id = f_prev_id.gather(1, top_p)
+                p_prev2_id = f_prev2_id.gather(1, top_p)
+                p_prev3_id = f_prev3_id.gather(1, top_p)
+                p_surv = f_surv.gather(1, top_p)
+                p_qp_back = (
+                    f_qp_back[:, :p_d, :]
+                    if prev_h_back_is_zero
+                    else f_qp_back.gather(
+                        1, top_p.unsqueeze(-1).expand(bsz, p_d, two_m_back)
                     )
+                )
+                p_rnn = (
+                    f_rnn.gather(1, top_p.unsqueeze(-1).expand(bsz, p_d, rnn_rank))
+                    if f_rnn is not None
+                    else None
+                )
+
+            if defer_this_spine and spine_entry_surv is None:
+                spine_entry_surv = p_surv  # [B, 1]
+
+            h_base_d = hidden_blocks[:, depth, :]  # [B, D]
+            logits_base_d = base_logits[:, depth, :]  # [B, V_draft]
+            pre_hj: Tensor | None = None
+            if depth > 0 and not prev_h_back_is_zero and self.kraus_head is not None:
+                p_qp_flat = p_qp_back.reshape(bp, two_m_back)
+                p_h_back = (
+                    self.kraus_head.kraus_backaction_proj(
+                        p_qp_flat.to(self.kraus_head.kraus_backaction_proj.weight.dtype)
+                    )
+                    .view(bsz, p_d, d_model)
+                    .to(hidden_blocks.dtype)
+                )
+                h_node = (h_base_d.unsqueeze(1) + p_h_back).reshape(bp, d_model)
+                if torch.is_grad_enabled():
+                    back_logits = F.linear(
+                        p_h_back.reshape(bp, d_model).to(self.lm_head.weight.dtype),
+                        self.lm_head.weight,
+                    ).view(bsz, p_d, v_draft)
+                else:
+                    w_back_vocab = self.kraus_head._get_backaction_vocab_weight(
+                        self.lm_head.weight
+                    )
+                    back_logits = F.linear(
+                        p_qp_flat.to(w_back_vocab.dtype), w_back_vocab
+                    ).view(bsz, p_d, v_draft)
+                logits_in = (
+                    logits_base_d.unsqueeze(1) + back_logits.to(logits_base_d.dtype)
+                ).reshape(bp, v_draft)
+            elif p_d == 1:
+                h_node = h_base_d
+                logits_in = logits_base_d
+                if h_joint_all is not None:
+                    pre_hj = h_joint_all[:, depth, :]
+            else:
+                h_node = (
+                    h_base_d.unsqueeze(1)
+                    .expand(bsz, p_d, d_model)
+                    .reshape(bp, d_model)
+                )
+                logits_in = (
+                    logits_base_d.unsqueeze(1)
+                    .expand(bsz, p_d, v_draft)
+                    .reshape(bp, v_draft)
+                )
+                if h_joint_all is not None:
+                    pre_hj = (
+                        h_joint_all[:, depth, :]
+                        .unsqueeze(1)
+                        .expand(bsz, p_d, -1)
+                        .reshape(bp, -1)
+                    )
+
+            logits_u, p_emb_u, next_rnn_u = self._step_markov_and_engram_logits(
+                base_logits_k=logits_in,
+                h_k=h_node,
+                cur_prev_id=p_prev_id.reshape(bp),
+                cur_prev_prev_id=p_prev2_id.reshape(bp),
+                cur_prev3_id=p_prev3_id.reshape(bp),
+                rnn_state=p_rnn.reshape(bp, rnn_rank) if p_rnn is not None else None,
+                precomputed_h_joint=pre_hj,
+            )
+
+            has_next_level = (sched_idx + 1) < num_sched and (depth + 1) < k_horizons
+            need_povm = self.kraus_head is not None and (
+                sched_idx == 0
+                or (has_next_level and (temperature > 0.0 or w_max > 1))
+            )
+
+            povm_diag_u: Tensor | None = None
+            top_idx_u: Tensor | None = None
+            eff_c = 1
+            if need_povm and self.kraus_head is not None:
+                eff_c = min(v_draft, max(w_max, self.kraus_head.top_c))
+                top_idx_u = logits_u.topk(eff_c, dim=-1).indices  # [BP, C]
+                cand_logits = logits_u.gather(dim=-1, index=top_idx_u)
+                q_rep = (
+                    q_obs[:, depth, :]
+                    .unsqueeze(1)
+                    .expand(bsz, p_d, -1)
+                    .reshape(bp, -1)
+                )
+                p_rep = (
+                    p_obs[:, depth, :]
+                    .unsqueeze(1)
+                    .expand(bsz, p_d, -1)
+                    .reshape(bp, -1)
+                )
+                _, povm_diag_u, _ = self.kraus_head.compute_povm_from_top_idx(
+                    cand_logits, top_idx_u, self.lm_head.weight, q_rep, p_rep
+                )
+                comp_err = (povm_diag_u.sum(dim=-2) - 1.0).abs().max()
+                max_povm_err = torch.maximum(max_povm_err, comp_err)
+
+            if defer_this_spine:
+                draft_tok_1 = (
+                    top_idx_u[:, :1]
+                    if top_idx_u is not None
+                    else logits_u.argmax(dim=-1, keepdim=True)
+                )  # [B, 1]
+                c_draft = draft_tok_1
+                c_target = self._map_draft_to_target_ids(draft_tok_1)
+                c_parent = p_node  # [B, 1]
+                c_surv = p_surv
+                deferred_depths.append(depth)
+                deferred_w_starts.append(w_start)
+                deferred_h.append(h_node)
+                if p_emb_u is not None:
+                    deferred_pemb.append(p_emb_u)
+                deferred_logits.append(logits_u)
+                deferred_draft.append(draft_tok_1)
+
+                tree_draft_ids[:, w_start:w_end] = c_target
+                tree_parent_idx[:, w_start:w_end] = c_parent
+                tree_depths[:, w_start:w_end] = depth + 1
+            else:
+                if self.born_confidence_head is not None:
+                    born_rep = (
+                        born_obs[:, depth : depth + 1, :]
+                        .expand(bsz, p_d, -1)
+                        .reshape(bp, 1, -1)
+                    )
+                    pvac_rep = (
+                        p_vac[:, depth : depth + 1, :]
+                        .expand(bsz, p_d, -1)
+                        .reshape(bp, 1, -1)
+                    )
+                    pur_rep = (
+                        purity[:, depth : depth + 1, :]
+                        .expand(bsz, p_d, -1)
+                        .reshape(bp, 1, -1)
+                    )
+                    conf_u = torch.sigmoid(
+                        self.born_confidence_head(
+                            hidden_blocks=h_node.unsqueeze(1),
+                            prev_emb=p_emb_u.unsqueeze(1)
+                            if (
+                                p_emb_u is not None
+                                and self.config.confidence_head_with_markov
+                            )
+                            else None,
+                            born_features=born_rep,
+                            p_vac=pvac_rep,
+                            purity=pur_rep,
+                        ).float()
+                    ).reshape(bp)
+                else:
+                    conf_u = torch.ones((bp,), dtype=torch.float32, device=dev)
+
+                p_surv_flat = p_surv.reshape(bp)
+                draft_toks_r: list[Tensor] = []
+                target_toks_r: list[Tensor] = []
+                tok_probs_r: list[Tensor] = []
+                survs_r: list[Tensor] = []
+                q_r_list: list[Tensor] = []
+
+                if temperature <= 0.0 and not return_q_probs:
+                    if top_idx_u is not None and eff_c >= w_max:
+                        greedy_top = top_idx_u[:, :w_max]
+                    elif w_max == 1:
+                        greedy_top = logits_u.argmax(dim=-1, keepdim=True)
+                    else:
+                        greedy_top = logits_u.topk(w_max, dim=-1).indices
+                    top_logits = logits_u.gather(dim=-1, index=greedy_top).float()
+                    lse = torch.logsumexp(logits_u.float(), dim=-1, keepdim=True)
+                    top_base_q = torch.exp(top_logits - lse)
+                    rem_mass = torch.ones((bp,), dtype=torch.float32, device=dev)
+                    for r in range(w_max):
+                        draft_tok = greedy_top[:, r]
+                        base_p_r = top_base_q[:, r]
+                        tok_prob = base_p_r / rem_mass.clamp_min(1e-12)
+                        rem_mass = rem_mass - base_p_r
+                        target_tok = self._map_draft_to_target_ids(draft_tok)
+                        child_surv = p_surv_flat * conf_u * tok_prob.clamp_min(1e-4)
+                        draft_toks_r.append(draft_tok)
+                        target_toks_r.append(target_tok)
+                        tok_probs_r.append(tok_prob)
+                        survs_r.append(child_surv)
+                else:
+                    if temperature > 0.0:
+                        base_q = torch.softmax(
+                            logits_u.float() / float(temperature), dim=-1
+                        )
+                        greedy_top = None
+                    else:
+                        base_q = torch.softmax(logits_u.float(), dim=-1)
+                        greedy_top = (
+                            top_idx_u[:, :w_max]
+                            if (top_idx_u is not None and eff_c >= w_max)
+                            else logits_u.topk(w_max, dim=-1).indices
+                        )
+
+                    avail_mask = torch.ones_like(base_q)
+                    for r in range(w_max):
+                        masked_q = base_q * avail_mask
+                        mass = masked_q.sum(dim=-1, keepdim=True)
+                        has_mass = mass > 1e-12
+                        safe_q = masked_q / mass.clamp_min(1e-12)
+                        if temperature > 0.0 or return_q_probs:
+                            unif_q = avail_mask / avail_mask.sum(
+                                dim=-1, keepdim=True
+                            ).clamp_min(1.0)
+                            q_r = torch.where(has_mass, safe_q, unif_q)
+                        else:
+                            q_r = safe_q
+
+                        if temperature > 0.0:
+                            draft_tok = torch.multinomial(
+                                q_r, num_samples=1
+                            ).squeeze(-1)
+                        else:
+                            assert greedy_top is not None
+                            draft_tok = greedy_top[:, r]
+
+                        avail_mask.scatter_(1, draft_tok.unsqueeze(-1), 0.0)
+                        tok_prob = q_r.gather(1, draft_tok.unsqueeze(-1)).squeeze(-1)
+                        target_tok = self._map_draft_to_target_ids(draft_tok)
+                        child_surv = p_surv_flat * conf_u * tok_prob.clamp_min(1e-4)
+
+                        draft_toks_r.append(draft_tok)
+                        target_toks_r.append(target_tok)
+                        tok_probs_r.append(tok_prob)
+                        survs_r.append(child_surv)
+                        if return_q_probs:
+                            q_r_list.append(q_r)
+
+                def _pack_pr(
+                    items: list[Tensor],
+                    _p_d: int = p_d,
+                    _w_max: int = w_max,
+                    _n_d: int = n_d,
+                ) -> Tensor:
+                    stacked = torch.stack(items, dim=1).view(
+                        bsz, _p_d * _w_max, *items[0].shape[1:]
+                    )
+                    return stacked[:, :_n_d]
+
+                c_draft = _pack_pr(draft_toks_r)  # [B, n_d]
+                c_target = _pack_pr(target_toks_r)  # [B, n_d]
+                c_prob = _pack_pr(tok_probs_r)  # [B, n_d]
+                c_surv = _pack_pr(survs_r)  # [B, n_d]
+                c_parent = (
+                    p_node.unsqueeze(-1)
+                    .expand(bsz, p_d, w_max)
+                    .reshape(bsz, p_d * w_max)[:, :n_d]
+                )
+
+                tree_draft_ids[:, w_start:w_end] = c_target
+                tree_parent_idx[:, w_start:w_end] = c_parent
+                tree_depths[:, w_start:w_end] = depth + 1
+                tree_token_probs[:, w_start:w_end] = c_prob
+                tree_survival[:, w_start:w_end] = c_surv
+                if return_q_probs:
+                    tree_q_probs[:, w_start:w_end, :] = _pack_pr(q_r_list)
+
+            if depth > 0:
+                parent_rows = tree_attn_mask.gather(
+                    1,
+                    c_parent.clamp(min=0)
+                    .unsqueeze(-1)
+                    .expand(bsz, n_d, tree_budget),
+                )
+                has_p = (c_parent >= 0).unsqueeze(-1)
+                tree_attn_mask[:, w_start:w_end, :] = tree_attn_mask[
+                    :, w_start:w_end, :
+                ] | (parent_rows & has_p)
+
+            has_next_level = (sched_idx + 1) < num_sched and (depth + 1) < k_horizons
+            if has_next_level:
+                # Expand parent index [0..p_d-1] for each active child [0..n_d-1]
+                parent_local_idx = (
+                    torch.arange(p_d, device=dev)
+                    .unsqueeze(-1)
+                    .expand(p_d, w_max)
+                    .reshape(p_d * w_max)[:n_d]
+                )
+
+                if (
+                    self.kraus_head is not None
+                    and povm_diag_u is not None
+                    and top_idx_u is not None
+                    and (temperature > 0.0 or w_max > 1)
+                ):
+                    m_plus_1 = self.kraus_head.n_modes + 1
+                    top_idx_bp = top_idx_u.view(bsz, p_d, eff_c)
+                    povm_bp = povm_diag_u.view(bsz, p_d, eff_c, m_plus_1)
+
+                    top_idx_child = top_idx_bp.index_select(
+                        1, parent_local_idx
+                    )  # [B, n_d, C]
+                    povm_child = povm_bp.index_select(
+                        1, parent_local_idx
+                    )  # [B, n_d, C, M+1]
+
+                    matches = top_idx_child == c_draft.unsqueeze(-1)  # [B, n_d, C]
+                    has_match = matches.any(dim=-1, keepdim=True)  # [B, n_d, 1]
+                    match_pos = matches.to(torch.int32).argmax(dim=-1)  # [B, n_d]
+                    matched_povm = povm_child.gather(
+                        2,
+                        match_pos.unsqueeze(-1)
+                        .unsqueeze(-1)
+                        .expand(bsz, n_d, 1, m_plus_1),
+                    ).squeeze(2)
+                    fallback_povm = torch.full_like(
+                        matched_povm, 1.0 / float(max(1, eff_c))
+                    )
+                    povm_row = torch.where(has_match, matched_povm, fallback_povm)
+
+                    q_next = q_obs[:, depth + 1, :].unsqueeze(1)  # [B, 1, M]
+                    p_next = p_obs[:, depth + 1, :].unsqueeze(1)  # [B, 1, M]
+                    raw_qp_back = self.kraus_head.collapse_branch_qp(
+                        q_next.expand(bsz, n_d, -1),
+                        p_next.expand(bsz, n_d, -1),
+                        povm_row,
+                        hidden_blocks.dtype,
+                    )
+                    top1_qp_back_p = self.kraus_head.collapse_branch_qp(
+                        q_next.expand(bsz, p_d, -1),
+                        p_next.expand(bsz, p_d, -1),
+                        povm_bp[:, :, 0, :],
+                        hidden_blocks.dtype,
+                    )
+                    f_qp_back = raw_qp_back - top1_qp_back_p.index_select(
+                        1, parent_local_idx
+                    )
+                    prev_h_back_is_zero = False
+                else:
+                    f_qp_back = torch.zeros(
+                        (bsz, n_d, two_m_back), dtype=hidden_blocks.dtype, device=dev
+                    )
+                    prev_h_back_is_zero = True
+
+                f_node = (
+                    torch.arange(w_start, w_end, dtype=torch.long, device=dev)
+                    .unsqueeze(0)
+                    .expand(bsz, n_d)
+                )
+                c_prev_expanded = p_prev_id.index_select(1, parent_local_idx)
+                c_prev2_expanded = p_prev2_id.index_select(1, parent_local_idx)
+                f_prev_id = (
+                    c_target
+                    if self.config.sample_from_anchor
+                    else (c_prev_expanded if depth == 0 else c_target)
+                )
+                f_prev2_id = c_prev_expanded
+                f_prev3_id = c_prev2_expanded
+                f_surv = c_surv
+                if next_rnn_u is not None:
+                    f_rnn = next_rnn_u.view(bsz, p_d, rnn_rank).index_select(
+                        1, parent_local_idx
+                    )
+                else:
+                    f_rnn = None
+
+        if deferred_depths and spine_entry_surv is not None:
+            s_len = len(deferred_depths)
+            d_first = deferred_depths[0]
+            d_last_plus_1 = deferred_depths[-1] + 1
+            h_sp = torch.stack(deferred_h, dim=1)  # [B, S, D]
+            pemb_sp = (
+                torch.stack(deferred_pemb, dim=1)
+                if (deferred_pemb and self.config.confidence_head_with_markov)
+                else None
+            )
+            if self.born_confidence_head is not None:
+                conf_sp = torch.sigmoid(
+                    self.born_confidence_head(
+                        hidden_blocks=h_sp,
+                        prev_emb=pemb_sp,
+                        born_features=born_obs[:, d_first:d_last_plus_1, :],
+                        p_vac=p_vac[:, d_first:d_last_plus_1, :],
+                        purity=purity[:, d_first:d_last_plus_1, :],
+                    ).float()
+                )  # [B, S]
+            else:
+                conf_sp = torch.ones((bsz, s_len), dtype=torch.float32, device=dev)
+
+            logits_sp = torch.stack(deferred_logits, dim=1)  # [B, S, V_draft]
+            draft_sp = torch.stack(deferred_draft, dim=1)  # [B, S, 1]
+            top_log_sp = logits_sp.gather(dim=-1, index=draft_sp).float().squeeze(-1)
+            lse_sp = torch.logsumexp(logits_sp.float(), dim=-1)
+            prob_sp = torch.exp(top_log_sp - lse_sp)  # [B, S]
+            surv_sp = spine_entry_surv * torch.cumprod(
+                conf_sp * prob_sp.clamp_min(1e-4), dim=1
+            )
+            ws0 = deferred_w_starts[0]
+            ws1 = deferred_w_starts[-1] + 1
+            tree_token_probs[:, ws0:ws1] = prob_sp
+            tree_survival[:, ws0:ws1] = surv_sp
 
         tree_dict = {
             "tree_draft_ids": tree_draft_ids,

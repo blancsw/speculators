@@ -212,6 +212,9 @@ class PurityLoadAwareAmdahlScheduler:
         self.aleatoric_purity_threshold = float(aleatoric_purity_threshold)
         self.aleatoric_entropy_boost = float(aleatoric_entropy_boost)
         self.min_survival_floor = float(min_survival_floor)
+        self._gpu_cost_cache: dict[
+            tuple[torch.device, int, int], tuple[Tensor, Tensor]
+        ] = {}
 
     @staticmethod
     def _slice_slot_metric(metric: Tensor | None, k_cap: int) -> Tensor | None:
@@ -256,17 +259,9 @@ class PurityLoadAwareAmdahlScheduler:
         p_vac: Tensor | None = None,  # [B, K] or [B] in [0, 1]
         draft_entropy: Tensor | None = None,  # [B, K] normalized entropy in [0, 1]
         temperature: float = 0.0,
+        temperatures_tensor: Tensor | None = None,  # optional [B] GPU float32
     ) -> tuple[Tensor, Tensor]:
-        """Compute coherence-gated acceptance ``alpha_eff`` and survival ``S_k``.
-
-        At ``T > 0``, high entropy ``H(q_k)`` paired with high Lindblad purity
-        ``P_k >= aleatoric_purity_threshold`` and low vacuum leakage ``p_vac``
-        indicates shared verifier-drafter aleatoric sampling entropy (where true
-        speculative acceptance ``1 - D_TV(p, q)`` stays high!), so confidence is
-        protected against entropy-induced under-prediction rather than penalized.
-        Conversely, low purity ``P_k << 1`` or high ``p_vac`` reflects epistemic
-        decoherence and smoothly attenuates ``alpha_eff``.
-        """
+        """Compute coherence-gated acceptance ``alpha_eff`` and survival ``S_k``."""
         if confidences.ndim != _RANK_2D:
             raise ValueError(
                 f"confidences must be 2D [B, K], got shape {tuple(confidences.shape)}."
@@ -282,14 +277,14 @@ class PurityLoadAwareAmdahlScheduler:
             0.0, 1.0
         )
 
-        # Epistemic coherence gate: exactly 1.0 when pure (P_k = 1, p_vac = 0)
         coherence_gate = (pur**self.purity_exponent) * (
             (1.0 - vac) ** self.vacuum_exponent
         )
         alpha_eff = conf * coherence_gate
 
-        if temperature > 0.0 and self.aleatoric_entropy_boost > 0.0:
-            # Protect creative T > 0 drafting when state remains pure & in-simplex
+        if self.aleatoric_entropy_boost > 0.0 and (
+            temperature > 0.0 or temperatures_tensor is not None
+        ):
             pure_excess = (
                 (pur - self.aleatoric_purity_threshold)
                 / max(1e-6, 1.0 - self.aleatoric_purity_threshold)
@@ -297,12 +292,111 @@ class PurityLoadAwareAmdahlScheduler:
             aleatoric_recovery = (
                 self.aleatoric_entropy_boost * pure_excess * (1.0 - vac) * ent
             )
-            alpha_eff = (alpha_eff + aleatoric_recovery * (1.0 - alpha_eff)).clamp(
+            boosted = (alpha_eff + aleatoric_recovery * (1.0 - alpha_eff)).clamp(
                 0.0, 1.0
             )
+            if temperatures_tensor is not None:
+                temp_col = temperatures_tensor.to(
+                    device=conf.device, dtype=torch.float32
+                ).view(-1, 1)
+                stoch_mask = temp_col > 0.0  # >0 enables stochastic boost
+                alpha_eff = torch.where(stoch_mask, boosted, alpha_eff)
+            else:
+                alpha_eff = boosted
 
         prefix_survival = torch.cumprod(alpha_eff.clamp(0.0, 1.0), dim=-1)
         return alpha_eff, prefix_survival
+
+    def _get_gpu_cost_tables(
+        self,
+        dev: torch.device,
+        eff_batch: int,
+        k_cap: int,
+    ) -> tuple[Tensor, Tensor]:
+        """Return cached GPU ``(inv_denom_vec [k_cap+1], gamma_vec [k_cap+1])``."""
+        key = (dev, eff_batch, k_cap)
+        cached = self._gpu_cost_cache.get(key)
+        if cached is not None:
+            return cached
+
+        t_base_ms = self.roofline.estimate_verify_latency_ms(
+            eff_batch, tokens_per_req=1
+        )
+        marginal_ver_delta = (
+            self.roofline.estimate_verify_latency_ms(eff_batch, 2) - t_base_ms
+        ) / max(t_base_ms, 1e-6)
+        ridge = float(max(1, self.roofline.ridge_tokens))
+
+        inv_denoms: list[float] = [1.0 / max(t_base_ms, 1e-6)]
+        gammas: list[float] = [1.0]
+        for k_cand in range(1, k_cap + 1):
+            t_draft = self.roofline.estimate_draft_latency_ms(
+                eff_batch, spec_budget=k_cand, is_tree=False
+            )
+            t_ver = self.roofline.estimate_verify_latency_ms(
+                eff_batch, tokens_per_req=1 + k_cand
+            )
+            inv_denoms.append(1.0 / max(t_draft + t_ver, 1e-6))
+            load_ratio = (eff_batch * max(1, 1 + k_cand)) / ridge
+            gamma_k = max(
+                self.min_survival_floor,
+                min(0.85, marginal_ver_delta * (1.0 if load_ratio > 1.0 else 0.5)),
+            )
+            gammas.append(gamma_k)
+
+        inv_t = torch.tensor(inv_denoms, dtype=torch.float32, device=dev)
+        gam_t = torch.tensor(gammas, dtype=torch.float32, device=dev)
+        self._gpu_cost_cache[key] = (inv_t, gam_t)
+        return inv_t, gam_t
+
+    def select_horizon_tensor(
+        self,
+        confidences: Tensor,  # [B, K]
+        active_batch_size: int | None = None,
+        purity: Tensor | None = None,
+        p_vac: Tensor | None = None,
+        draft_entropy: Tensor | None = None,
+        temperature: float = 0.0,
+        temperatures_tensor: Tensor | None = None,
+        valid_req_count: int | None = None,
+        valid_mask: Tensor | None = None,
+    ) -> Tensor:
+        """Zero-sync CUDA-Graph-safe horizon selector returning ``[B]`` int64 on GPU."""
+        bsz, k_avail = confidences.shape
+        eff_batch = max(1, int(active_batch_size or valid_req_count or bsz))
+        k_cap = min(k_avail, self.max_horizon)
+        dev = confidences.device
+
+        _, prefix_survival = self.compute_effective_survival(
+            confidences=confidences[:, :k_cap],
+            purity=self._slice_slot_metric(purity, k_cap),
+            p_vac=self._slice_slot_metric(p_vac, k_cap),
+            draft_entropy=self._slice_slot_metric(draft_entropy, k_cap),
+            temperature=temperature,
+            temperatures_tensor=temperatures_tensor,
+        )
+        inv_denom_vec, gamma_vec = self._get_gpu_cost_tables(dev, eff_batch, k_cap)
+        if valid_mask is not None:
+            valid_f = valid_mask.to(device=dev, dtype=torch.float32).view(bsz, 1)
+            denom = valid_f.sum().clamp(min=1.0)
+            mean_surv_by_k = (prefix_survival * valid_f).sum(dim=0) / denom
+        else:
+            n_mean = max(1, min(bsz, int(valid_req_count or bsz)))
+            mean_surv_by_k = prefix_survival[:n_mean].mean(dim=0)  # [k_cap]
+        cum_tau = torch.cat(
+            [
+                torch.ones((1,), dtype=torch.float32, device=dev),
+                1.0 + torch.cumsum(mean_surv_by_k, dim=0),
+            ],
+            dim=0,
+        )
+        cand_tps = (1000.0 * eff_batch) * cum_tau * inv_denom_vec
+        best_k = cand_tps.argmax(dim=0)  # scalar int64 in [0, k_cap]
+        gamma_load = gamma_vec.gather(0, best_k)
+        keep_mask = torch.cumprod(
+            (prefix_survival >= gamma_load).to(torch.int64), dim=-1
+        )
+        return torch.minimum(keep_mask.sum(dim=-1), best_k)
 
     def select_horizon(
         self,

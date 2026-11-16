@@ -10,8 +10,14 @@ from torch.nn import functional as F  # noqa: N812
 from transformers.models.qwen3.modeling_qwen3 import GradientCheckpointingLayer
 
 from speculators.models.kvn_dspark.triton_kernels import (
-    fused_multistep_complex_decode,
+    HAS_TRITON,
+    fused_2d_osc_dynamics_multistep_decode,
+    fused_dyadic_rff_2stage_trig,
+    fused_engram_hash_rmsnorm,
+    fused_interferometer_born_obs,
     fused_multistep_sp4_decode,
+    fused_rmsnorm_trig_mod,
+    segmented_2d_osc_scan,
     segmented_complex_scan,
     segmented_scalar_scan,
     segmented_sp4_scan,
@@ -33,6 +39,10 @@ __all__ = [
     "specinfer_verify_single_step",
     "specinfer_verify_tree",
 ]
+
+
+def _tensor_version(t: Tensor | None) -> int:
+    return int(t._version) if t is not None else 0  # noqa: SLF001
 
 
 class DataReuploadingLinear(nn.Module):
@@ -163,39 +173,142 @@ class ModalDataReuploadingRFF(nn.Module):
             self.register_buffer("phase_rff", phase_init)
 
         self.raw_alpha = nn.Parameter(torch.zeros(n_modes))
+        self._cached_rx_cat: tuple[Tensor, Tensor, tuple[int, ...]] | None = None
+
+    @staticmethod
+    def _tver(t: Tensor | None) -> int:
+        return int(t._version) if t is not None else 0  # noqa: SLF001
+
+    def _get_fused_rx2_weights(self) -> tuple[Tensor, Tensor]:
+        w0 = self.reupload_x[0].weight
+        b0 = self.reupload_x[0].bias
+        w1 = self.reupload_x[1].weight
+        b1 = self.reupload_x[1].bias
+        sig = (
+            w0.data_ptr(),
+            self._tver(w0),
+            self._tver(b0),
+            w1.data_ptr(),
+            self._tver(w1),
+            self._tver(b1),
+        )
+        if (
+            self._cached_rx_cat is not None
+            and self._cached_rx_cat[2] == sig
+            and self._cached_rx_cat[0].device == w0.device
+        ):
+            return self._cached_rx_cat[0], self._cached_rx_cat[1]
+        w_cat = torch.cat([w0, w1], dim=0).contiguous()
+        z_b = torch.zeros(w0.size(0), dtype=w0.dtype, device=w0.device)
+        b_cat = torch.cat(
+            [b0 if b0 is not None else z_b, b1 if b1 is not None else z_b], dim=0
+        ).contiguous()
+        if not (w_cat.is_cuda and torch.cuda.is_current_stream_capturing()):
+            self._cached_rx_cat = (w_cat, b_cat, sig)
+        return w_cat, b_cat
+
+    def forward_from_x_low(
+        self, x_low: Tensor, orig_dtype: torch.dtype
+    ) -> tuple[Tensor, Tensor]:
+        """Compute ``(r_q, r_p)`` from pre-projected ``x_low`` for ``dyadic_rff``."""
+        scale = 1.0 / math.sqrt(max(1, self.n_modes))
+        if (
+            self.dyadic_rff
+            and self.reupload_layers_l == 2
+            and HAS_TRITON
+            and not torch.is_grad_enabled()
+            and x_low.is_cuda
+            and not torch.compiler.is_compiling()
+            and x_low.dtype in (torch.bfloat16, torch.float16)
+        ):
+            w_rx, b_rx = self._get_fused_rx2_weights()
+            zx_both = F.linear(x_low, w_rx, b_rx)
+            z0 = zx_both[..., : self.eff_d_re]
+            z1_x = zx_both[..., self.eff_d_re :]
+            n0 = self.stage_norms[0]
+            n1 = self.stage_norms[1]
+            eps0 = float(getattr(n0, "eps", None) or 1e-6)
+            eps1 = float(getattr(n1, "eps", None) or 1e-6)
+            zbar0, h_mod = fused_rmsnorm_trig_mod(
+                z0, n0.weight, eps=eps0, add_residual=None, write_hmod=True
+            )
+            assert h_mod is not None
+            z1_h = self.reupload_h[0](h_mod)
+            zbar1, _ = fused_rmsnorm_trig_mod(
+                z1_x, n1.weight, eps=eps1, add_residual=z1_h, write_hmod=False
+            )
+            flat_rows = zbar0.numel() // self.eff_d_re
+            z_stack = torch.stack(
+                [
+                    zbar0.view(flat_rows, self.eff_d_re),
+                    zbar1.view(flat_rows, self.eff_d_re),
+                ],
+                dim=0,
+            ).float()
+            omega_f32 = getattr(self, "_cached_omega_f32", None)
+            omega_ver = self._tver(self.omega_rff)
+            if (
+                omega_f32 is None
+                or omega_f32.device != self.omega_rff.device
+                or omega_f32.shape != self.omega_rff.shape
+                or getattr(self, "_cached_omega_ver", -1) != omega_ver
+            ):
+                omega_f32 = self.omega_rff.float().contiguous()
+                if not (omega_f32.is_cuda and torch.cuda.is_current_stream_capturing()):
+                    self._cached_omega_f32 = omega_f32
+                    self._cached_omega_ver = omega_ver
+            projs = torch.bmm(z_stack, omega_f32)  # [2, N, M] float32
+            proj0 = projs[0].view(*x_low.shape[:-1], self.n_modes)
+            proj1 = projs[1].view(*x_low.shape[:-1], self.n_modes)
+            return fused_dyadic_rff_2stage_trig(
+                proj0=proj0,
+                proj1=proj1,
+                phase_rff=self.phase_rff,
+                raw_alpha=self.raw_alpha,
+                out_dtype=orig_dtype,
+                scale=scale,
+            )
+
+        inv_sqrt2 = 0.7071067811865475
+        h_mod = torch.zeros_like(x_low)
+        c_acc: Tensor | None = None
+        s_acc: Tensor | None = None
+        omega_f = self.omega_rff.float()
+        phase_f = self.phase_rff.float()
+
+        for l_idx in range(self.reupload_layers_l):
+            z = self.reupload_x[l_idx](x_low)
+            if l_idx > 0:
+                z = z + self.reupload_h[l_idx - 1](h_mod)
+            z_bar = self.stage_norms[l_idx](z)
+            if l_idx < self.reupload_layers_l - 1:
+                h_mod = h_mod + inv_sqrt2 * (torch.sin(z_bar) + torch.cos(z_bar))
+
+            dyadic_scale = float(1 << l_idx)
+            proj_l = z_bar.float() @ omega_f[l_idx]
+            phi_l = dyadic_scale * proj_l + phase_f[l_idx]
+            c_l = torch.cos(phi_l)
+            s_l = torch.sin(phi_l)
+            if c_acc is None or s_acc is None:
+                c_acc, s_acc = c_l, s_l
+            else:
+                c_next = c_acc * c_l - s_acc * s_l
+                s_next = c_acc * s_l + s_acc * c_l
+                c_acc, s_acc = c_next, s_next
+
+        assert c_acc is not None and s_acc is not None
+        cos_p = c_acc.to(orig_dtype)
+        sin_p = s_acc.to(orig_dtype)
+        alpha = torch.tanh(self.raw_alpha.to(orig_dtype))
+        r_q = scale * (cos_p + alpha * (cos_p * cos_p - sin_p * sin_p))
+        r_p = scale * (sin_p + 2.0 * alpha * (cos_p * sin_p))
+        return r_q, r_p
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
         inv_sqrt2 = 0.7071067811865475
         if self.dyadic_rff:
             x_low = self.in_proj(x)
-            h_mod = torch.zeros_like(x_low)
-            c_acc: Tensor | None = None
-            s_acc: Tensor | None = None
-            omega_f = self.omega_rff.float()
-            phase_f = self.phase_rff.float()
-
-            for l_idx in range(self.reupload_layers_l):
-                z = self.reupload_x[l_idx](x_low)
-                if l_idx > 0:
-                    z = z + self.reupload_h[l_idx - 1](h_mod)
-                z_bar = self.stage_norms[l_idx](z)
-                if l_idx < self.reupload_layers_l - 1:
-                    h_mod = h_mod + inv_sqrt2 * (torch.sin(z_bar) + torch.cos(z_bar))
-
-                dyadic_scale = float(1 << l_idx)
-                phi_l = dyadic_scale * (z_bar.float() @ omega_f[l_idx]) + phase_f[l_idx]
-                c_l = torch.cos(phi_l)
-                s_l = torch.sin(phi_l)
-                if c_acc is None or s_acc is None:
-                    c_acc, s_acc = c_l, s_l
-                else:
-                    c_next = c_acc * c_l - s_acc * s_l
-                    s_next = c_acc * s_l + s_acc * c_l
-                    c_acc, s_acc = c_next, s_next
-
-            assert c_acc is not None and s_acc is not None
-            cos_p = c_acc.to(x.dtype)
-            sin_p = s_acc.to(x.dtype)
+            return self.forward_from_x_low(x_low, x.dtype)
         elif self.use_legacy_dense and self.legacy_reupload is not None:
             h = self.legacy_reupload(x)
             proj = (h.float() @ self.omega_rff.float() + self.phase_rff.float()).to(
@@ -240,6 +353,8 @@ class ModalDataReuploadingRFF(nn.Module):
             self.raw_alpha.data[top_idx.to(self.raw_alpha.device)].clone()
         )
         self.n_modes = int(top_idx.numel())
+        self._cached_omega_f32 = None
+        self._cached_rx_cat = None
 
 
 class SpeculativeEngram(nn.Module):
@@ -288,6 +403,25 @@ class SpeculativeEngram(nn.Module):
         prev_prev_id: Tensor | None = None,
         prev3_id: Tensor | None = None,
     ) -> Tensor:
+        if (
+            HAS_TRITON
+            and not torch.is_grad_enabled()
+            and prev_id.is_cuda
+            and not torch.compiler.is_compiling()
+            and prev_prev_id is not None
+            and prev3_id is not None
+        ):
+            normed = fused_engram_hash_rmsnorm(
+                p1=prev_id,
+                p2=prev_prev_id,
+                p3=prev3_id,
+                table_weight=self.engram_table.weight,
+                rms_weight=self.engram_norm.weight,
+                buckets=self.engram_buckets,
+                eps=float(self.engram_norm.eps or 1e-6),
+            )
+            return self.engram_proj(normed)
+
         p1 = prev_id.long().clamp_min(0)
         if prev_prev_id is None:
             if p1.ndim >= 2 and p1.size(-1) > 1:
@@ -620,14 +754,48 @@ class CausalKvNRFFLayer(GradientCheckpointingLayer):
         q_f: Tensor,
         p_f: Tensor,
         out_dtype: torch.dtype,
+        need_p_vac: bool = True,
     ) -> tuple[Tensor, Tensor | None]:
         """Project FP32 (q_f, p_f) to out_dtype readout residual and rescued p_vac."""
+        if (
+            HAS_TRITON
+            and self.use_triton_scan
+            and not torch.is_grad_enabled()
+            and q_f.is_cuda
+            and not torch.compiler.is_compiling()
+            and self.n_modes % 2 == 0
+        ):
+            obs, _, _, _, p_vac_f = fused_interferometer_born_obs(
+                q_f=q_f,
+                p_f=p_f,
+                out_dtype=out_dtype,
+                dyad_theta=(
+                    self.interferometer.dyad_theta
+                    if self.interferometer is not None
+                    else None
+                ),
+                dyad_phase=(
+                    self.interferometer.dyad_phase
+                    if self.interferometer is not None
+                    else None
+                ),
+                vacuum_log_kappa=(
+                    self.vacuum_log_kappa if self.vacuum_born_norm else None
+                ),
+                return_stats=bool(
+                    need_p_vac
+                    and self.vacuum_born_norm
+                    and self.vacuum_log_kappa is not None
+                ),
+            )
+            return self.readout_norm(self.readout_linear(obs)), p_vac_f
+
         if self.interferometer is not None:
             q_obs_f, p_obs_f = self.interferometer(q_f, p_f)
         else:
             q_obs_f, p_obs_f = q_f, p_f
 
-        p_vac_f: Tensor | None = None
+        p_vac_f = None
         if self.vacuum_born_norm and self.vacuum_log_kappa is not None:
             born_f, p_vac_f = compute_vacuum_born_observables(
                 q_obs_f, p_obs_f, self.vacuum_log_kappa
@@ -644,7 +812,7 @@ class CausalKvNRFFLayer(GradientCheckpointingLayer):
     def _compute_readout(
         self, q_f: Tensor, p_f: Tensor, out_dtype: torch.dtype
     ) -> Tensor:
-        readout, _ = self.compute_observables(q_f, p_f, out_dtype)
+        readout, _ = self.compute_observables(q_f, p_f, out_dtype, need_p_vac=False)
         return readout
 
     def _build_sp4_transition_and_forcing(
@@ -872,11 +1040,11 @@ class CausalKvNRFFLayer(GradientCheckpointingLayer):
         parity.
         """
         h_norm = self.norm1(x_step)
-        r_q, r_p = self.reupload(h_norm)
-        dt = F.softplus(self.dt_proj(h_norm))
         bsz = x_step.size(0)
 
         if self.use_symplectic_butterfly:
+            r_q, r_p = self.reupload(h_norm)
+            dt = F.softplus(self.dt_proj(h_norm))
             a_mat, u_vec, dtheta_f, a_nu, u_nu = self._build_sp4_transition_and_forcing(
                 h_norm, r_q, r_p, dt, reset_mask=reset_mask
             )
@@ -921,11 +1089,10 @@ class CausalKvNRFFLayer(GradientCheckpointingLayer):
                     else None
                 )
         else:
-            raw_env = (
-                self.lindblad_env_proj(h_norm)
-                if self.lindblad_env_proj is not None
-                else None
+            r_q, r_p, raw_dt, raw_env = self._eval_proj_and_rff(
+                h_norm, with_env=(self.lindblad_env_proj is not None)
             )
+            dt = F.softplus(raw_dt)
             with torch.amp.autocast(device_type=x_step.device.type, enabled=False):
                 dt_f = dt.float()
                 eta = (
@@ -989,6 +1156,89 @@ class CausalKvNRFFLayer(GradientCheckpointingLayer):
             return x_out, (q_t, p_t, nu_f.to(state_dtype)), dtheta
         return x_out, (q_t, p_t), dtheta
 
+    def _get_fused_decode_in_weights(
+        self, with_env: bool
+    ) -> tuple[Tensor, Tensor]:
+        in_lin = self.reupload.in_proj
+        assert isinstance(in_lin, nn.Linear)
+        w_in = in_lin.weight
+        w_dt = self.dt_proj.weight
+        b_dt = self.dt_proj.bias
+        sig_parts = [
+            int(with_env),
+            self.n_modes,
+            w_in.data_ptr(),
+            _tensor_version(w_in),
+            w_dt.data_ptr(),
+            _tensor_version(w_dt),
+            _tensor_version(b_dt),
+        ]
+        if with_env and self.lindblad_env_proj is not None:
+            w_e = self.lindblad_env_proj.weight
+            b_e = self.lindblad_env_proj.bias
+            sig_parts.extend(
+                [
+                    w_e.data_ptr(),
+                    _tensor_version(w_e),
+                    _tensor_version(b_e),
+                ]
+            )
+        sig = tuple(sig_parts)
+        cached = getattr(self, "_cached_in_dt_env", None)
+        if (
+            cached is not None
+            and cached[2] == sig
+            and cached[0].device == w_in.device
+        ):
+            return cached[0], cached[1]
+        z_in = torch.zeros(w_in.size(0), dtype=w_in.dtype, device=w_in.device)
+        b_in = in_lin.bias if in_lin.bias is not None else z_in
+        z_dt = torch.zeros(w_dt.size(0), dtype=w_dt.dtype, device=w_dt.device)
+        b_dt_t = b_dt if b_dt is not None else z_dt
+        if with_env and self.lindblad_env_proj is not None:
+            w_e = self.lindblad_env_proj.weight
+            b_e = self.lindblad_env_proj.bias
+            z_e = torch.zeros(w_e.size(0), dtype=w_e.dtype, device=w_e.device)
+            w_cat = torch.cat([w_in, w_dt, w_e], dim=0).contiguous()
+            b_cat = torch.cat(
+                [b_in, b_dt_t, b_e if b_e is not None else z_e], dim=0
+            ).contiguous()
+        else:
+            w_cat = torch.cat([w_in, w_dt], dim=0).contiguous()
+            b_cat = torch.cat([b_in, b_dt_t], dim=0).contiguous()
+        if not torch.cuda.is_current_stream_capturing():
+            self._cached_in_dt_env = (w_cat, b_cat, sig)
+        return w_cat, b_cat
+
+    def _eval_proj_and_rff(
+        self, h_norm: Tensor, with_env: bool
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+        """Run ``in_proj`` + fused Triton Dyadic RFF + ``dt_proj`` / env proj."""
+        eff_env = bool(with_env and self.lindblad_env_proj is not None)
+        if (
+            not torch.is_grad_enabled()
+            and self.reupload.dyadic_rff
+            and isinstance(self.reupload.in_proj, nn.Linear)
+            and not torch.compiler.is_compiling()
+        ):
+            w_cat, b_cat = self._get_fused_decode_in_weights(eff_env)
+            proj_all = F.linear(h_norm, w_cat, b_cat)
+            d_re = self.reupload.eff_d_re
+            m = self.n_modes
+            x_low = proj_all[..., :d_re].contiguous()
+            raw_dt = proj_all[..., d_re : d_re + m]
+            raw_env = proj_all[..., d_re + m :] if eff_env else None
+            r_q, r_p = self.reupload.forward_from_x_low(x_low, h_norm.dtype)
+            return r_q, r_p, raw_dt, raw_env
+        r_q, r_p = self.reupload(h_norm)
+        raw_dt = self.dt_proj(h_norm)
+        raw_env = (
+            self.lindblad_env_proj(h_norm)
+            if (eff_env and self.lindblad_env_proj is not None)
+            else None
+        )
+        return r_q, r_p, raw_dt, raw_env
+
     def multistep_decode(
         self,
         x_block: Tensor,  # [B, S_max, D]
@@ -1000,10 +1250,11 @@ class CausalKvNRFFLayer(GradientCheckpointingLayer):
     ) -> tuple[Tensor, Tensor, Tensor, Tensor | None, Tensor]:
         """Batched pre/post-GEMM + fused multi-step decode over [B, S_max, D]."""
         h_norm = self.norm1(x_block)
-        r_q, r_p = self.reupload(h_norm)
-        dt = F.softplus(self.dt_proj(h_norm))
 
         if self.use_symplectic_butterfly:
+            r_q, r_p = self.reupload(h_norm)
+            raw_dt = self.dt_proj(h_norm)
+            dt = F.softplus(raw_dt)
             a_mat, u_vec, dtheta_f, a_nu, u_nu = self._build_sp4_transition_and_forcing(
                 h_norm, r_q, r_p, dt, reset_mask=None
             )
@@ -1023,45 +1274,36 @@ class CausalKvNRFFLayer(GradientCheckpointingLayer):
                 q_fin_f, p_fin_f = self._unpack_sp4_state(z_final.unsqueeze(1))
                 q_fin_f = q_fin_f.squeeze(1)
                 p_fin_f = p_fin_f.squeeze(1)
+            q_fin_out = q_fin_f.to(state_dtype)
+            p_fin_out = p_fin_f.to(state_dtype)
+            nu_fin_out = nu_final.to(state_dtype) if nu_final is not None else None
+            dtheta_out = dtheta_f.to(x_block.dtype)
         else:
-            raw_env = (
-                self.lindblad_env_proj(h_norm)
-                if self.lindblad_env_proj is not None
-                else None
+            with_env = bool(self.lindblad_env_proj is not None and nu_init is not None)
+            r_q, r_p, raw_dt, raw_env = self._eval_proj_and_rff(
+                h_norm, with_env=with_env
             )
             with torch.amp.autocast(device_type=x_block.device.type, enabled=False):
-                dt_f = dt.float()
-                eta = (
-                    torch.exp(self.log_eta.float())
-                    .clamp(min=self.damping_min, max=self.damping_max)
-                    .view(1, 1, -1)
-                )
-                omega_pole = self.kvn_omega.float().view(1, 1, -1)
-                dtheta_f = dt_f * omega_pole
-                decay = torch.exp(-eta * dt_f)
-                a_cos = decay * torch.cos(dtheta_f)
-                a_sin = decay * torch.sin(dtheta_f)
-                u_q_f = dt_f * self.in_gain_q.float().view(1, 1, -1) * r_q.float()
-                u_p_f = dt_f * self.in_gain_p.float().view(1, 1, -1) * r_p.float()
-                if raw_env is not None and self.lindblad_gain is not None:
-                    a_nu = torch.exp(-2.0 * eta * dt_f)
-                    g_sq = self.lindblad_gain.float().square().view(1, 1, -1)
-                    u_nu = dt_f * g_sq * F.softplus(raw_env.float())
-                else:
-                    a_nu, u_nu = None, None
-
-                q_seq_f, p_seq_f, q_fin_f, p_fin_f, _, nu_final = (
-                    fused_multistep_complex_decode(
-                        a_cos=a_cos,
-                        a_sin=a_sin,
-                        u_q=u_q_f,
-                        u_p=u_p_f,
-                        q_init=q_init.float(),
-                        p_init=p_init.float(),
+                q_seq_f, p_seq_f, q_fin_out, p_fin_out, nu_fin_out, dtheta_out = (
+                    fused_2d_osc_dynamics_multistep_decode(
+                        r_q=r_q,
+                        r_p=r_p,
+                        raw_dt=raw_dt,
+                        raw_env=raw_env,
+                        log_eta=self.log_eta,
+                        kvn_omega=self.kvn_omega,
+                        in_gain_q=self.in_gain_q,
+                        in_gain_p=self.in_gain_p,
+                        lindblad_gain=self.lindblad_gain,
+                        q_init=q_init,
+                        p_init=p_init,
+                        nu_init=nu_init,
                         valid_lens=valid_lens,
-                        a_nu=a_nu,
-                        u_nu=u_nu,
-                        nu_init=nu_init.float() if nu_init is not None else None,
+                        damping_min=self.damping_min,
+                        damping_max=self.damping_max,
+                        state_dtype=state_dtype,
+                        dtheta_dtype=x_block.dtype,
+                        use_triton=self.use_triton_scan,
                     )
                 )
 
@@ -1070,10 +1312,10 @@ class CausalKvNRFFLayer(GradientCheckpointingLayer):
         x_out = x_out + self.ffn(self.norm2(x_out))
         return (
             x_out,
-            q_fin_f.to(state_dtype),
-            p_fin_f.to(state_dtype),
-            nu_final.to(state_dtype) if nu_final is not None else None,
-            dtheta_f.to(x_block.dtype),
+            q_fin_out,
+            p_fin_out,
+            nu_fin_out,
+            dtheta_out,
         )
 
     def forward(
@@ -1086,8 +1328,6 @@ class CausalKvNRFFLayer(GradientCheckpointingLayer):
     ):
         """Run O(T log T) parallel scan; returns FP32 (q_seq, p_seq[, nu_seq])."""
         h_norm = self.norm1(x)
-        r_q, r_p = self.reupload(h_norm)
-        dt = F.softplus(self.dt_proj(h_norm))
 
         init_q = (
             initial_state[0].float()
@@ -1110,6 +1350,8 @@ class CausalKvNRFFLayer(GradientCheckpointingLayer):
         )
 
         if self.use_symplectic_butterfly:
+            r_q, r_p = self.reupload(h_norm)
+            dt = F.softplus(self.dt_proj(h_norm))
             a_mat, u_vec, dtheta_f, a_nu, u_nu = self._build_sp4_transition_and_forcing(
                 h_norm, r_q, r_p, dt, reset_mask=reset_mask
             )
@@ -1134,11 +1376,15 @@ class CausalKvNRFFLayer(GradientCheckpointingLayer):
                     else None
                 )
         else:
-            raw_env = (
-                self.lindblad_env_proj(h_norm)
-                if self.lindblad_env_proj is not None
-                else None
+            need_nu = bool(
+                self.lindblad_env_proj is not None
+                and self.lindblad_gain is not None
+                and (return_nu or torch.is_grad_enabled())
             )
+            r_q, r_p, raw_dt, raw_env = self._eval_proj_and_rff(
+                h_norm, with_env=need_nu
+            )
+            dt = F.softplus(raw_dt)
             with torch.amp.autocast(device_type=x.device.type, enabled=False):
                 dt_f = dt.float()
                 eta = (
@@ -1151,46 +1397,47 @@ class CausalKvNRFFLayer(GradientCheckpointingLayer):
                 decay = torch.exp(-eta * dt_f)
                 a_cos = decay * torch.cos(dtheta_f)
                 a_sin = decay * torch.sin(dtheta_f)
-                a_nu = torch.exp(-2.0 * eta * dt_f) if raw_env is not None else None
-
-                if reset_mask is not None:
-                    keep = (~reset_mask).to(torch.float32).unsqueeze(-1)
-                    a_cos = a_cos * keep
-                    a_sin = a_sin * keep
-                    if a_nu is not None:
-                        a_nu = a_nu * keep
 
                 u_q_f = dt_f * self.in_gain_q.float().view(1, 1, -1) * r_q.float()
                 u_p_f = dt_f * self.in_gain_p.float().view(1, 1, -1) * r_p.float()
 
-                c_init = (
-                    (init_q, init_p)
-                    if (init_q is not None and init_p is not None)
-                    else None
-                )
-                q_f, p_f = segmented_complex_scan(
-                    a_cos,
-                    a_sin,
-                    u_q_f,
-                    u_p_f,
-                    initial_state=c_init,
-                    use_triton=self.use_triton_scan,
-                )
                 if (
                     raw_env is not None
-                    and a_nu is not None
                     and self.lindblad_gain is not None
                 ):
+                    a_nu = torch.exp(-2.0 * eta * dt_f)
                     g_sq = self.lindblad_gain.float().square().view(1, 1, -1)
                     u_nu = dt_f * g_sq * F.softplus(raw_env.float())
-                    nu_f = segmented_scalar_scan(
-                        a_nu,
-                        u_nu,
-                        initial_state=init_nu,
-                        use_triton=self.use_triton_scan,
-                    )
                 else:
-                    nu_f = None
+                    a_nu = None
+                    u_nu = None
+
+                init_state_2d: tuple[Tensor, ...] | None = None
+                if init_q is not None and init_p is not None:
+                    init_state_2d = (
+                        (init_q, init_p, init_nu)
+                        if init_nu is not None
+                        else (init_q, init_p)
+                    )
+                elif init_nu is not None:
+                    z0_qp = torch.zeros(
+                        (x.size(0), self.n_modes),
+                        dtype=torch.float32,
+                        device=x.device,
+                    )
+                    init_state_2d = (z0_qp, z0_qp, init_nu)
+
+                q_f, p_f, nu_f = segmented_2d_osc_scan(
+                    a_cos=a_cos,
+                    a_sin=a_sin,
+                    u_q=u_q_f,
+                    u_p=u_p_f,
+                    a_nu=a_nu,
+                    u_nu=u_nu,
+                    reset_mask=reset_mask,
+                    initial_state=init_state_2d,
+                    use_triton=self.use_triton_scan,
+                )
 
         readout = self._compute_readout(q_f, p_f, x.dtype)
         x_out = x + readout
@@ -1425,6 +1672,7 @@ class CausalKvNRFFLayer(GradientCheckpointingLayer):
         new_readout.bias.copy_(bias_new)
         self.readout_linear = new_readout
         self.n_modes = target_modes
+        self._cached_in_dt_env = None
         return top_idx
 
     @torch.no_grad()
@@ -1530,7 +1778,13 @@ class MultiHorizonKoopmanRollout(nn.Module):
                 return q_list[-1], p_list[-1], dtheta_list[-1], nu_list[-1]
             return q_list[-1], p_list[-1], dtheta_list[-1]
 
-        weights = torch.softmax(self.layer_mode_logits.float(), dim=0).unsqueeze(1)
+        weights = (
+            torch.softmax(
+                self.layer_mode_logits.float().transpose(0, 1).contiguous(), dim=-1
+            )
+            .transpose(0, 1)
+            .unsqueeze(1)
+        )
         q_stack = torch.stack([q.float() for q in q_list], dim=0)
         p_stack = torch.stack([p.float() for p in p_list], dim=0)
         dt_stack = torch.stack([dt.float() for dt in dtheta_list], dim=0)
@@ -1586,21 +1840,65 @@ class MultiHorizonKoopmanRollout(nn.Module):
         q_k = cos_a * q_0 - sin_a * p_0 + u_q_hor
         p_k = sin_a * q_0 + cos_a * p_0 + u_p_hor
 
-        if self.interferometer is not None:
-            q_obs, p_obs = self.interferometer(q_k, p_k)
-        else:
-            q_obs, p_obs = q_k, p_k
-
-        if self.vacuum_born_norm and self.vacuum_log_kappa is not None:
-            born_f, p_vac_f = compute_vacuum_born_observables(
-                q_obs, p_obs, self.vacuum_log_kappa
+        if (
+            HAS_TRITON
+            and not torch.is_grad_enabled()
+            and q_k.is_cuda
+            and not torch.compiler.is_compiling()
+            and self.n_modes % 2 == 0
+        ):
+            obs_k, q_obs_t, p_obs_t, born_feat_t, p_vac_t = (
+                fused_interferometer_born_obs(
+                    q_f=q_k,
+                    p_f=p_k,
+                    out_dtype=anchor_h.dtype,
+                    dyad_theta=(
+                        self.interferometer.dyad_theta
+                        if self.interferometer is not None
+                        else None
+                    ),
+                    dyad_phase=(
+                        self.interferometer.dyad_phase
+                        if self.interferometer is not None
+                        else None
+                    ),
+                    vacuum_log_kappa=(
+                        self.vacuum_log_kappa if self.vacuum_born_norm else None
+                    ),
+                    return_stats=True,
+                )
             )
+            assert (
+                q_obs_t is not None
+                and p_obs_t is not None
+                and born_feat_t is not None
+                and p_vac_t is not None
+            )
+            q_obs = q_obs_t
+            p_obs = p_obs_t
+            born_features = born_feat_t
+            p_vac_f = p_vac_t
         else:
-            born_f = (2.0 * self.n_modes) * (q_obs.square() + p_obs.square()) - 1.0
-            p_vac_f = torch.ones(
-                (n_blocks, self.block_size, max(1, self.n_modes // 2)),
-                dtype=torch.float32,
-                device=anchor_h.device,
+            if self.interferometer is not None:
+                q_obs, p_obs = self.interferometer(q_k, p_k)
+            else:
+                q_obs, p_obs = q_k, p_k
+
+            if self.vacuum_born_norm and self.vacuum_log_kappa is not None:
+                born_f, p_vac_f = compute_vacuum_born_observables(
+                    q_obs, p_obs, self.vacuum_log_kappa
+                )
+            else:
+                born_f = (2.0 * self.n_modes) * (q_obs.square() + p_obs.square()) - 1.0
+                p_vac_f = torch.ones(
+                    (n_blocks, self.block_size, max(1, self.n_modes // 2)),
+                    dtype=torch.float32,
+                    device=anchor_h.device,
+                )
+            born_features = born_f.to(anchor_h.dtype)
+            obs_k = torch.cat(
+                [q_obs.to(anchor_h.dtype), p_obs.to(anchor_h.dtype), born_features],
+                dim=-1,
             )
 
         if anchor_nu is not None:
@@ -1609,11 +1907,6 @@ class MultiHorizonKoopmanRollout(nn.Module):
         else:
             purity_f = torch.ones_like(q_obs)
 
-        born_features = born_f.to(anchor_h.dtype)
-        obs_k = torch.cat(
-            [q_obs.to(anchor_h.dtype), p_obs.to(anchor_h.dtype), born_features],
-            dim=-1,
-        )
         kvn_hidden = self.obs_norm(self.obs_linear(obs_k))
 
         anchor_cond = self.anchor_proj(anchor_h).view(
@@ -1992,23 +2285,87 @@ class KrausPOVMHead(nn.Module):
         self.kraus_mode_gate = nn.Parameter(torch.ones(n_modes))
         self.kraus_log_kappa = nn.Parameter(torch.zeros(()))
         self.kraus_logit_scale = nn.Parameter(torch.tensor(0.05))
+        self._cached_vocab_mode_scores: Tensor | None = None
+        self._cached_lm_w_ptr: int = -1
+        self._cached_lm_w_ver: int = -1
+        self._cached_proj_w_ptr: int = -1
+        self._cached_proj_w_ver: int = -1
+        self._cached_proj_b_ver: int = -1
+        self._cached_back_vocab_w: Tensor | None = None
+        self._cached_back_lm_ptr: int = -1
+        self._cached_back_lm_ver: int = -1
+        self._cached_back_w_ptr: int = -1
+        self._cached_back_w_ver: int = -1
 
-    def compute_povm(
+    def _get_backaction_vocab_weight(self, lm_head_weight: Tensor) -> Tensor:
+        """Return cached ``lm_head_weight @ kraus_backaction_proj.weight``."""
+        back_w = self.kraus_backaction_proj.weight
+        if torch.compiler.is_compiling():
+            return (lm_head_weight.float() @ back_w.float()).to(lm_head_weight.dtype)
+        lm_ver = _tensor_version(lm_head_weight)
+        bw_ver = _tensor_version(back_w)
+        cached = self._cached_back_vocab_w
+        if (
+            cached is not None
+            and cached.device == lm_head_weight.device
+            and cached.dtype == lm_head_weight.dtype
+            and cached.shape == (lm_head_weight.size(0), 2 * self.n_modes)
+            and self._cached_back_lm_ptr == lm_head_weight.data_ptr()
+            and self._cached_back_lm_ver == lm_ver
+            and self._cached_back_w_ptr == back_w.data_ptr()
+            and self._cached_back_w_ver == bw_ver
+        ):
+            return cached
+        fused_w = (lm_head_weight.float() @ back_w.float()).to(lm_head_weight.dtype)
+        if not (fused_w.is_cuda and torch.cuda.is_current_stream_capturing()):
+            self._cached_back_vocab_w = fused_w
+            self._cached_back_lm_ptr = lm_head_weight.data_ptr()
+            self._cached_back_lm_ver = lm_ver
+            self._cached_back_w_ptr = back_w.data_ptr()
+            self._cached_back_w_ver = bw_ver
+        return fused_w
+
+    def _get_vocab_mode_scores(self, lm_head_weight: Tensor) -> Tensor:
+        """Return cached ``kraus_mode_proj(lm_head_weight)`` ``[V_draft, M+1]``."""
+        proj_w = self.kraus_mode_proj.weight
+        if torch.compiler.is_compiling():
+            return self.kraus_mode_proj(lm_head_weight.to(proj_w.dtype))
+        proj_b = self.kraus_mode_proj.bias
+        b_ver = _tensor_version(proj_b)
+        lm_ver = _tensor_version(lm_head_weight)
+        pw_ver = _tensor_version(proj_w)
+        cached = self._cached_vocab_mode_scores
+        if (
+            cached is not None
+            and cached.device == lm_head_weight.device
+            and cached.shape == (lm_head_weight.size(0), self.n_modes + 1)
+            and self._cached_lm_w_ptr == lm_head_weight.data_ptr()
+            and self._cached_lm_w_ver == lm_ver
+            and self._cached_proj_w_ptr == proj_w.data_ptr()
+            and self._cached_proj_w_ver == pw_ver
+            and self._cached_proj_b_ver == b_ver
+        ):
+            return cached
+        scores = self.kraus_mode_proj(lm_head_weight.to(proj_w.dtype))
+        if not (scores.is_cuda and torch.cuda.is_current_stream_capturing()):
+            self._cached_vocab_mode_scores = scores
+            self._cached_lm_w_ptr = lm_head_weight.data_ptr()
+            self._cached_lm_w_ver = lm_ver
+            self._cached_proj_w_ptr = proj_w.data_ptr()
+            self._cached_proj_w_ver = pw_ver
+            self._cached_proj_b_ver = b_ver
+        return scores
+
+    def _povm_from_scores(
         self,
-        cand_logits: Tensor,  # [..., C]
-        cand_vecs: Tensor,  # [..., C, D]
+        scores: Tensor,  # [..., C, M+1] float32
         q_state: Tensor,  # [..., M]
         p_state: Tensor,  # [..., M]
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Return ``(p_kraus [..., C], povm_diag [..., C, M+1], psi_sq [..., M+1])``."""
         m = self.n_modes
-        scores = self.kraus_mode_proj(
-            cand_vecs
-        ).float() + cand_logits.float().unsqueeze(-1)
-        # Softmax over candidate axis (-2) guarantees sum_{y in C} povm_diag[y, j] == 1
-        # for all j!
-        povm_diag = torch.softmax(scores, dim=-2)
-
+        povm_diag = torch.softmax(
+            scores.transpose(-1, -2).contiguous(), dim=-1
+        ).transpose(-1, -2)
         gate_sq = self.kraus_mode_gate.float().square()
         e_modes = (
             float(m) * gate_sq * (q_state.float().square() + p_state.float().square())
@@ -2020,9 +2377,42 @@ class KrausPOVMHead(nn.Module):
         )
         e_all = torch.cat([e_modes, e_vac], dim=-1)
         psi_sq = e_all / e_all.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-
         p_kraus = (povm_diag * psi_sq.unsqueeze(-2)).sum(dim=-1)
         return p_kraus, povm_diag, psi_sq
+
+    def compute_povm(
+        self,
+        cand_logits: Tensor,  # [..., C]
+        cand_vecs: Tensor,  # [..., C, D]
+        q_state: Tensor,  # [..., M]
+        p_state: Tensor,  # [..., M]
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Return ``(p_kraus [..., C], povm_diag [..., C, M+1], psi_sq [..., M+1])``."""
+        scores = self.kraus_mode_proj(
+            cand_vecs
+        ).float() + cand_logits.float().unsqueeze(-1)
+        return self._povm_from_scores(scores, q_state, p_state)
+
+    def compute_povm_from_top_idx(
+        self,
+        cand_logits: Tensor,  # [..., C]
+        top_idx: Tensor,  # [..., C]
+        lm_head_weight: Tensor,  # [V_draft, D]
+        q_state: Tensor,  # [..., M]
+        p_state: Tensor,  # [..., M]
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Fast POVM evaluation without gathering ``[C, D]`` ``lm_head`` rows."""
+        if torch.is_grad_enabled():
+            cand_vecs = lm_head_weight.index_select(0, top_idx.reshape(-1)).view(
+                *top_idx.shape, self.d_model
+            )
+            return self.compute_povm(cand_logits, cand_vecs, q_state, p_state)
+        vocab_scores = self._get_vocab_mode_scores(lm_head_weight)
+        mode_scores = vocab_scores.index_select(0, top_idx.reshape(-1)).view(
+            *top_idx.shape, self.n_modes + 1
+        )
+        scores = mode_scores.float() + cand_logits.float().unsqueeze(-1)
+        return self._povm_from_scores(scores, q_state, p_state)
 
     def forward_topc_logit_delta(
         self,
@@ -2040,18 +2430,38 @@ class KrausPOVMHead(nn.Module):
             top_idx = logits.topk(eff_c, dim=-1).indices  # [N, K, C]
 
         cand_logits = logits.gather(dim=-1, index=top_idx)
-        cand_vecs = lm_head_weight.index_select(0, top_idx.reshape(-1)).view(
-            *top_idx.shape, self.d_model
-        )
-        p_kraus, povm_diag, _ = self.compute_povm(cand_logits, cand_vecs, q_obs, p_obs)
-
-        # Collapse top-1 modal amplitude to keep kraus_backaction_proj actively trained
-        # end-to-end
-        top1_gain = torch.sqrt(povm_diag[..., 0, : self.n_modes].clamp_min(1e-12))
-        q_col = (q_obs.float() * top1_gain).to(lm_head_weight.dtype)
-        p_col = (p_obs.float() * top1_gain).to(lm_head_weight.dtype)
-        back_h = self.kraus_backaction_proj(torch.cat([q_col, p_col], dim=-1))
-        back_cand = (cand_vecs.to(back_h.dtype) * back_h.unsqueeze(-2)).sum(dim=-1)
+        if torch.is_grad_enabled():
+            cand_vecs = lm_head_weight.index_select(0, top_idx.reshape(-1)).view(
+                *top_idx.shape, self.d_model
+            )
+            p_kraus, povm_diag, _ = self.compute_povm(
+                cand_logits, cand_vecs, q_obs, p_obs
+            )
+            top1_gain = torch.sqrt(povm_diag[..., 0, : self.n_modes].clamp_min(1e-12))
+            q_col = (q_obs.float() * top1_gain).to(lm_head_weight.dtype)
+            p_col = (p_obs.float() * top1_gain).to(lm_head_weight.dtype)
+            back_h = self.kraus_backaction_proj(torch.cat([q_col, p_col], dim=-1))
+            back_cand = (cand_vecs.to(back_h.dtype) * back_h.unsqueeze(-2)).sum(dim=-1)
+        else:
+            p_kraus, povm_diag, _ = self.compute_povm_from_top_idx(
+                cand_logits, top_idx, lm_head_weight, q_obs, p_obs
+            )
+            top1_gain = torch.sqrt(povm_diag[..., 0, : self.n_modes].clamp_min(1e-12))
+            q_col = (q_obs.float() * top1_gain).to(lm_head_weight.dtype)
+            p_col = (p_obs.float() * top1_gain).to(lm_head_weight.dtype)
+            qp_col = torch.cat([q_col, p_col], dim=-1)
+            w_back_vocab = self._get_backaction_vocab_weight(lm_head_weight)
+            nk = logits.shape[0] * logits.shape[1]
+            if nk <= 18:
+                cand_bw = w_back_vocab.index_select(0, top_idx.reshape(-1)).view(
+                    *top_idx.shape, 2 * self.n_modes
+                )
+                back_cand = (
+                    cand_bw.float() * qp_col.float().unsqueeze(-2)
+                ).sum(dim=-1)
+            else:
+                back_full = F.linear(qp_col.to(w_back_vocab.dtype), w_back_vocab)
+                back_cand = back_full.gather(dim=-1, index=top_idx)
 
         scale = self.kraus_logit_scale.to(logits.dtype)
         cand_delta = scale * (
@@ -2061,6 +2471,21 @@ class KrausPOVMHead(nn.Module):
         delta_full = torch.zeros_like(logits)
         delta_full.scatter_add_(dim=-1, index=top_idx, src=cand_delta)
         return delta_full
+
+    def collapse_branch_qp(
+        self,
+        q_parent: Tensor,  # [..., M]
+        p_parent: Tensor,  # [..., M]
+        povm_row: Tensor,  # [..., M+1]
+        out_dtype: torch.dtype,
+    ) -> Tensor:
+        """Return collapsed modal ``[q_child, p_child]`` ``[..., 2*M]``."""
+        mode_w = povm_row[..., : self.n_modes].float().clamp_min(1e-12)
+        vac_w = povm_row[..., self.n_modes : self.n_modes + 1].float().clamp_min(1e-12)
+        normed_amp = torch.sqrt(mode_w / vac_w).clamp(min=0.1, max=10.0)
+        q_child = (q_parent.float() * normed_amp).to(out_dtype)
+        p_child = (p_parent.float() * normed_amp).to(out_dtype)
+        return torch.cat([q_child, p_child], dim=-1)
 
     def collapse_branch_state(
         self,
@@ -2119,6 +2544,8 @@ class KrausPOVMHead(nn.Module):
         self.kraus_backaction_proj = new_back
         self.kraus_mode_gate = nn.Parameter(self.kraus_mode_gate.data[top_idx].clone())
         self.n_modes = target_modes
+        self._cached_vocab_mode_scores = None
+        self._cached_back_vocab_w = None
 
 
 def specinfer_verify_single_step(
